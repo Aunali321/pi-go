@@ -1,0 +1,8 @@
+# Go build artifacts (cmd binaries built into the repo root)
+/dumppayload
+/dumpresp
+/dumpcompact
+/harnessrun
+/live
+*.test
+*.out
