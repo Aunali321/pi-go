@@ -19,11 +19,16 @@ type FileInfo struct {
 }
 
 type ExecOptions struct {
-	Cwd      string
-	Env      map[string]string
-	Timeout  int // seconds; 0 = none
-	OnStdout func(string)
-	OnStderr func(string)
+	Cwd string
+	// Env overrides inherited defaults when InheritEnv is nil or true; with
+	// InheritEnv false it is the complete environment.
+	Env map[string]string
+	// InheritEnv controls whether the execution environment's default
+	// variables are inherited. Nil defaults to true.
+	InheritEnv *bool
+	Timeout    float64 // seconds; 0 = none
+	OnStdout   func(string)
+	OnStderr   func(string)
 }
 
 type ExecResult struct {

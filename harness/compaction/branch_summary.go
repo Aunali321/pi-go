@@ -12,7 +12,9 @@ import (
 
 // BranchSummaryResult is the output of generating a branch summary.
 type BranchSummaryResult struct {
-	Summary       string
+	Summary string
+	// Usage from the LLM call that generated the summary, if available.
+	Usage         *llm.Usage
 	ReadFiles     []string
 	ModifiedFiles []string
 }
@@ -25,12 +27,15 @@ type CollectEntriesResult struct {
 
 // GenerateBranchSummaryOptions configures branch summary generation.
 type GenerateBranchSummaryOptions struct {
+	// Stream issues the summarization request; nil uses llm.StreamSimple.
+	Stream              agent.StreamFunc
 	Model               *llm.Model
-	APIKey              string
-	Headers             map[string]string
 	CustomInstructions  string
 	ReplaceInstructions bool
-	ReserveTokens       int
+	// ReserveTokens are reserved for prompt and model output. Defaults to 16384.
+	ReserveTokens int
+	Retry         *llm.RetryPolicy
+	Callbacks     *llm.RetryCallbacks
 }
 
 // CollectEntriesForBranchSummary collects entries to summarize before moving to
@@ -194,7 +199,8 @@ func GenerateBranchSummary(ctx context.Context, entries []session.SessionTreeEnt
 			Timestamp: time.Now(),
 		}},
 	}
-	resp := llm.CompleteSimple(ctx, opts.Model, reqCtx, &llm.StreamOptions{APIKey: opts.APIKey, Headers: opts.Headers, MaxTokens: 2048})
+	runner := SummaryRunner{Stream: opts.Stream, Model: opts.Model, Retry: opts.Retry, Callbacks: opts.Callbacks}
+	resp := runner.completeWithRetries(ctx, reqCtx, &llm.StreamOptions{MaxTokens: 2048})
 	if resp.StopReason == llm.StopAborted {
 		return nil, &BranchSummaryError{Code: BranchSummaryAborted, Msg: orDefault(resp.ErrorMessage, "Branch summary aborted")}
 	}
@@ -208,5 +214,5 @@ func GenerateBranchSummary(ctx context.Context, entries []session.SessionTreeEnt
 	if summary == "" {
 		summary = "No summary generated"
 	}
-	return &BranchSummaryResult{Summary: summary, ReadFiles: readFiles, ModifiedFiles: modifiedFiles}, nil
+	return &BranchSummaryResult{Summary: summary, Usage: &resp.Usage, ReadFiles: readFiles, ModifiedFiles: modifiedFiles}, nil
 }

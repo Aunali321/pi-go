@@ -10,7 +10,7 @@ import (
 
 func getEntriesToFork(storage SessionStorage, entryID *string, position string) ([]SessionTreeEntry, error) {
 	if entryID == nil {
-		return storage.GetEntries(), nil
+		return storage.GetEntries(nil), nil
 	}
 	target, ok := storage.GetEntry(*entryID)
 	if !ok {
@@ -30,7 +30,7 @@ func getEntriesToFork(storage SessionStorage, entryID *string, position string) 
 		}
 		effectiveLeaf = target.ParentID()
 	}
-	return storage.GetPathToRoot(effectiveLeaf)
+	return storage.GetPathToRootOrCompaction(effectiveLeaf)
 }
 
 // ForkOptions selects where a fork branches from.
@@ -167,6 +167,8 @@ type JsonlCreateOptions struct {
 	Cwd               string
 	ParentSessionPath string
 	ID                string
+	// Metadata is arbitrary application data stored in the session header.
+	Metadata map[string]any
 }
 
 func (r *JsonlSessionRepo) Create(ctx context.Context, opts JsonlCreateOptions) (*Session, error) {
@@ -188,7 +190,7 @@ func (r *JsonlSessionRepo) Create(ctx context.Context, opts JsonlCreateOptions) 
 	if err != nil {
 		return nil, err
 	}
-	storage, err := CreateJsonlSessionStorage(ctx, r.fs, path, opts.Cwd, id, opts.ParentSessionPath)
+	storage, err := CreateJsonlSessionStorage(ctx, r.fs, path, opts.Cwd, id, opts.ParentSessionPath, opts.Metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +301,11 @@ func (r *JsonlSessionRepo) Fork(ctx context.Context, source JsonlSessionMetadata
 	if parentPath == "" {
 		parentPath = source.Path
 	}
-	storage, err := CreateJsonlSessionStorage(ctx, r.fs, path, opts.Cwd, id, parentPath)
+	metadata := opts.Metadata
+	if metadata == nil {
+		metadata = source.Metadata
+	}
+	storage, err := CreateJsonlSessionStorage(ctx, r.fs, path, opts.Cwd, id, parentPath, metadata)
 	if err != nil {
 		return nil, err
 	}

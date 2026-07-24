@@ -47,13 +47,6 @@ func (h *AgentHarness) Compact(ctx context.Context, customInstructions string) (
 	if model == nil {
 		return nil, &AgentHarnessError{Code: HarnessInvalidState, Msg: "No model set for compaction"}
 	}
-	if h.getAuth == nil {
-		return nil, &AgentHarnessError{Code: HarnessAuth, Msg: "No auth available for compaction"}
-	}
-	auth, err := h.getAuth(model)
-	if err != nil || auth == nil {
-		return nil, &AgentHarnessError{Code: HarnessAuth, Msg: "No auth available for compaction"}
-	}
 
 	branchEntries, err := h.session.GetBranch(nil)
 	if err != nil {
@@ -79,13 +72,28 @@ func (h *AgentHarness) Compact(ctx context.Context, customInstructions string) (
 	if provided {
 		result = hookResult.Compaction
 	} else {
-		result, err = compaction.Compact(ctx, prep, model, auth.APIKey, auth.Headers, customInstructions, h.thinkingLevel)
+		runner := compaction.SummaryRunner{
+			Stream:        h.streamOrDefault(),
+			Model:         model,
+			ThinkingLevel: h.thinkingLevel,
+			Retry:         h.retry,
+			Callbacks:     h.retryCallbacks("compaction"),
+		}
+		result, err = compaction.Compact(ctx, prep, runner, customInstructions)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	entryID, err := h.session.AppendCompaction(ctx, result.Summary, result.FirstKeptEntryID, result.TokensBefore, result.Details, provided)
+	entryID, err := h.session.AppendCompaction(ctx, session.CompactionInput{
+		Summary:          result.Summary,
+		FirstKeptEntryID: result.FirstKeptEntryID,
+		TokensBefore:     result.TokensBefore,
+		RetainedTail:     result.RetainedTail,
+		Details:          result.Details,
+		Usage:            result.Usage,
+		FromHook:         provided,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -143,10 +151,12 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, summar
 
 	var summaryText string
 	var summaryDetails any
+	var summaryUsage *llm.Usage
 	fromHookSummary := false
 	if hookResult != nil && hookResult.Summary != nil {
 		summaryText = hookResult.Summary.Summary
 		summaryDetails = hookResult.Summary.Details
+		summaryUsage = hookResult.Summary.Usage
 		fromHookSummary = true
 	}
 
@@ -154,13 +164,6 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, summar
 		model := h.model
 		if model == nil {
 			return NavigateTreeResult{}, &AgentHarnessError{Code: HarnessInvalidState, Msg: "No model set for branch summary"}
-		}
-		if h.getAuth == nil {
-			return NavigateTreeResult{}, &AgentHarnessError{Code: HarnessAuth, Msg: "No auth available for branch summary"}
-		}
-		auth, err := h.getAuth(model)
-		if err != nil || auth == nil {
-			return NavigateTreeResult{}, &AgentHarnessError{Code: HarnessAuth, Msg: "No auth available for branch summary"}
 		}
 		ci := customInstructions
 		ri := replaceInstructions
@@ -173,8 +176,9 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, summar
 			}
 		}
 		bs, err := compaction.GenerateBranchSummary(ctx, collected.Entries, compaction.GenerateBranchSummaryOptions{
-			Model: model, APIKey: auth.APIKey, Headers: auth.Headers,
+			Stream: h.streamOrDefault(), Model: model,
 			CustomInstructions: ci, ReplaceInstructions: ri,
+			Retry: h.retry, Callbacks: h.retryCallbacks("branch_summary"),
 		})
 		if err != nil {
 			if be, ok := err.(*compaction.BranchSummaryError); ok && be.Code == compaction.BranchSummaryAborted {
@@ -183,6 +187,7 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, summar
 			return NavigateTreeResult{}, &AgentHarnessError{Code: HarnessBranchSummary, Msg: err.Error(), Err: err}
 		}
 		summaryText = bs.Summary
+		summaryUsage = bs.Usage
 		summaryDetails = map[string]any{"readFiles": bs.ReadFiles, "modifiedFiles": bs.ModifiedFiles}
 	}
 
@@ -205,7 +210,7 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, summar
 
 	var summaryInput *session.BranchSummaryInput
 	if summaryText != "" {
-		summaryInput = &session.BranchSummaryInput{Summary: summaryText, Details: summaryDetails, FromHook: fromHookSummary}
+		summaryInput = &session.BranchSummaryInput{Summary: summaryText, Details: summaryDetails, Usage: summaryUsage, FromHook: fromHookSummary}
 	}
 	summaryID, err := h.session.MoveTo(ctx, newLeafID, summaryInput)
 	if err != nil {

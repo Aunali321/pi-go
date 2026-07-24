@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/aunali321/pi-go/agent"
-	"github.com/aunali321/pi-go/harness/env"
 	"github.com/aunali321/pi-go/harness/message"
 	"github.com/aunali321/pi-go/harness/session"
 	"github.com/aunali321/pi-go/llm"
@@ -16,7 +15,6 @@ import (
 
 // SystemPromptContext is passed to a dynamic system-prompt function.
 type SystemPromptContext struct {
-	Env           env.ExecutionEnv
 	Session       *session.Session
 	Model         *llm.Model
 	ThinkingLevel llm.ThinkingLevel
@@ -29,19 +27,24 @@ type SystemPromptFunc func(SystemPromptContext) (string, error)
 
 // AgentHarnessOptions configures an AgentHarness.
 type AgentHarnessOptions struct {
-	Env              env.ExecutionEnv
-	Session          *session.Session
-	Tools            []agent.Tool
-	Resources        Resources
+	Session   *session.Session
+	Tools     []agent.Tool
+	Resources Resources
+	// Stream issues all model requests (turn streaming, compaction, branch
+	// summarization). Nil uses llm.StreamSimple, which resolves API keys from
+	// the environment.
+	Stream           agent.StreamFunc
 	SystemPrompt     string
 	SystemPromptFunc SystemPromptFunc
-	GetAuth          func(model *llm.Model) (*Auth, error)
 	StreamOptions    HarnessStreamOptions
-	Model            *llm.Model
-	ThinkingLevel    llm.ThinkingLevel
-	ActiveToolNames  []string
-	SteeringMode     agent.QueueMode
-	FollowUpMode     agent.QueueMode
+	// Retry optionally retries generated compaction and branch-summary
+	// requests on transient errors.
+	Retry           *llm.RetryPolicy
+	Model           *llm.Model
+	ThinkingLevel   llm.ThinkingLevel
+	ActiveToolNames []string
+	SteeringMode    agent.QueueMode
+	FollowUpMode    agent.QueueMode
 }
 
 type harnessTurnState struct {
@@ -59,8 +62,6 @@ type harnessTurnState struct {
 // AgentHarness orchestrates an Agent loop over a persistent Session with
 // resources, compaction, branch navigation, and a rich event/hook system.
 type AgentHarness struct {
-	Env env.ExecutionEnv
-
 	mu            sync.Mutex
 	session       *session.Session
 	phase         string
@@ -73,7 +74,8 @@ type AgentHarness struct {
 	systemPrompt     string
 	systemPromptFunc SystemPromptFunc
 	streamOptions    HarnessStreamOptions
-	getAuth          func(*llm.Model) (*Auth, error)
+	stream           agent.StreamFunc
+	retry            *llm.RetryPolicy
 	resources        Resources
 
 	tools           map[string]agent.Tool
@@ -101,7 +103,6 @@ type AgentHarness struct {
 // NewAgentHarness constructs a harness.
 func NewAgentHarness(opts AgentHarnessOptions) (*AgentHarness, error) {
 	h := &AgentHarness{
-		Env:              opts.Env,
 		session:          opts.Session,
 		phase:            "idle",
 		model:            opts.Model,
@@ -109,7 +110,8 @@ func NewAgentHarness(opts AgentHarnessOptions) (*AgentHarness, error) {
 		systemPrompt:     opts.SystemPrompt,
 		systemPromptFunc: opts.SystemPromptFunc,
 		streamOptions:    opts.StreamOptions.clone(),
-		getAuth:          opts.GetAuth,
+		stream:           opts.Stream,
+		retry:            opts.Retry,
 		resources:        opts.Resources.clone(),
 		tools:            map[string]agent.Tool{},
 		steeringMode:     opts.SteeringMode,
@@ -244,7 +246,7 @@ func (h *AgentHarness) createTurnState(ctx context.Context) (*harnessTurnState, 
 	systemPrompt := "You are a helpful assistant."
 	if h.systemPromptFunc != nil {
 		sp, err := h.systemPromptFunc(SystemPromptContext{
-			Env: h.Env, Session: h.session, Model: h.model,
+			Session: h.session, Model: h.model,
 			ThinkingLevel: h.thinkingLevel, ActiveTools: activeTools, Resources: resources,
 		})
 		if err != nil {
@@ -278,33 +280,46 @@ func (h *AgentHarness) createContext(ts *harnessTurnState, systemPrompt string) 
 	}
 }
 
+func (h *AgentHarness) streamOrDefault() agent.StreamFunc {
+	if h.stream != nil {
+		return h.stream
+	}
+	return llm.StreamSimple
+}
+
+// retryCallbacks reports retries of generated compaction and branch-summary
+// requests as harness events.
+func (h *AgentHarness) retryCallbacks(operation string) *llm.RetryCallbacks {
+	return &llm.RetryCallbacks{
+		OnRetryScheduled: func(attempt, maxAttempts int, delay time.Duration, errorMessage string) {
+			h.emit(RetryScheduledEvent{Operation: operation, Attempt: attempt, MaxAttempts: maxAttempts, Delay: delay, ErrorMessage: errorMessage}, context.Background())
+		},
+		OnRetryAttemptStart: func() {
+			h.emit(RetryAttemptStartEvent{Operation: operation}, context.Background())
+		},
+		OnRetryFinished: func(success bool, attempt int, finalError string) {
+			h.emit(RetryFinishedEvent{Operation: operation}, context.Background())
+		},
+	}
+}
+
 func (h *AgentHarness) createStreamFn(getTurnState func() *harnessTurnState) agent.StreamFunc {
 	return func(ctx context.Context, model *llm.Model, reqCtx *llm.Context, opts *llm.StreamOptions) *llm.Stream {
 		ts := getTurnState()
-		var auth *Auth
-		if h.getAuth != nil {
-			a, err := h.getAuth(model)
-			if err == nil {
-				auth = a
-			}
-		}
-		snapshot := ts.streamOptions.clone()
-		if auth != nil && len(auth.Headers) > 0 {
-			snapshot.Headers = mergeHeaders(snapshot.Headers, auth.Headers)
-		}
-		reqOptions := h.emitBeforeProviderRequest(model, ts.sessionID, snapshot)
+		reqOptions := h.emitBeforeProviderRequest(model, ts.sessionID, ts.streamOptions.clone())
 
 		streamOpts := &llm.StreamOptions{
 			CacheRetention: reqOptions.CacheRetention,
 			Headers:        reqOptions.Headers,
+			MaxRetries:     reqOptions.MaxRetries,
 			Reasoning:      opts.Reasoning,
 			SessionID:      ts.sessionID,
 		}
+		if reqOptions.MaxRetryDelayMs > 0 {
+			streamOpts.MaxRetryDelay = time.Duration(reqOptions.MaxRetryDelayMs) * time.Millisecond
+		}
 		if reqOptions.TimeoutMs > 0 {
 			streamOpts.Timeout = time.Duration(reqOptions.TimeoutMs) * time.Millisecond
-		}
-		if auth != nil {
-			streamOpts.APIKey = auth.APIKey
 		}
 		streamOpts.OnPayload = func(payload map[string]any) map[string]any {
 			return h.emitBeforeProviderPayload(model, payload)
@@ -312,7 +327,7 @@ func (h *AgentHarness) createStreamFn(getTurnState func() *harnessTurnState) age
 		streamOpts.OnResponse = func(status int, headers map[string]string) {
 			h.emit(AfterProviderResponseEvent{Status: status, Headers: headers}, ctx)
 		}
-		return llm.StreamSimple(ctx, model, reqCtx, streamOpts)
+		return h.streamOrDefault()(ctx, model, reqCtx, streamOpts)
 	}
 }
 
@@ -336,21 +351,6 @@ func (h *AgentHarness) emitBeforeProviderPayload(model *llm.Model, payload map[s
 		}
 	}
 	return current
-}
-
-func mergeHeaders(maps ...map[string]string) map[string]string {
-	merged := map[string]string{}
-	has := false
-	for _, m := range maps {
-		for k, v := range m {
-			merged[k] = v
-			has = true
-		}
-	}
-	if !has {
-		return nil
-	}
-	return merged
 }
 
 func (h *AgentHarness) drainQueued(queue *[]agent.AgentMessage, mode agent.QueueMode) []agent.AgentMessage {
@@ -411,11 +411,12 @@ func (h *AgentHarness) createLoopConfig(getTurnState func() *harnessTurnState, s
 			patch := h.emitToolResult(ToolResultEvent{
 				ToolCallID: c.ToolCall.ID, ToolName: c.ToolCall.Name, Input: c.Args,
 				Content: c.Result.Content, Details: c.Result.Details, IsError: c.IsError,
+				Usage: c.Result.Usage,
 			})
 			if patch == nil {
 				return nil
 			}
-			return &agent.AfterToolResult{Content: patch.Content, Details: patch.Details, IsError: patch.IsError, Terminate: patch.Terminate}
+			return &agent.AfterToolResult{Content: patch.Content, Details: patch.Details, IsError: patch.IsError, Usage: patch.Usage, Terminate: patch.Terminate}
 		},
 		PrepareNextTurn: func(agent.TurnInfo) *agent.TurnUpdate {
 			h.flushPendingSessionWrites(context.Background())

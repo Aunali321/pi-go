@@ -1,6 +1,8 @@
 package harness
 
 import (
+	"time"
+
 	"github.com/aunali321/pi-go/agent"
 	"github.com/aunali321/pi-go/harness/compaction"
 	"github.com/aunali321/pi-go/harness/session"
@@ -18,12 +20,6 @@ func (r Resources) clone() Resources {
 		Skills:          append([]Skill{}, r.Skills...),
 		PromptTemplates: append([]PromptTemplate{}, r.PromptTemplates...),
 	}
-}
-
-// Auth carries provider credentials.
-type Auth struct {
-	APIKey  string
-	Headers map[string]string
 }
 
 // HarnessStreamOptions are curated provider request options.
@@ -148,13 +144,29 @@ type ToolResultEvent struct {
 	Content    []llm.Content
 	Details    any
 	IsError    bool
+	// Usage from the tool execution itself, if available.
+	Usage *llm.Usage
 }
 type ToolResultPatch struct {
 	Content   []llm.Content
 	Details   any
 	IsError   *bool
+	Usage     *llm.Usage
 	Terminate *bool
 }
+
+// Retry events report retries of generated compaction and branch-summary
+// requests. Operation is "compaction" or "branch_summary".
+
+type RetryScheduledEvent struct {
+	Operation    string
+	Attempt      int
+	MaxAttempts  int
+	Delay        time.Duration
+	ErrorMessage string
+}
+type RetryAttemptStartEvent struct{ Operation string }
+type RetryFinishedEvent struct{ Operation string }
 
 type SessionBeforeCompactEvent struct {
 	Preparation        *compaction.CompactionPreparation
@@ -179,6 +191,8 @@ type SessionBeforeTreeResult struct {
 type TreeSummary struct {
 	Summary string
 	Details any
+	// Usage from the LLM call that generated this summary, if available.
+	Usage *llm.Usage
 }
 
 type TreePreparation struct {

@@ -7,7 +7,6 @@ import (
 
 	"github.com/aunali321/pi-go/agent"
 	"github.com/aunali321/pi-go/harness"
-	"github.com/aunali321/pi-go/harness/env"
 	"github.com/aunali321/pi-go/harness/session"
 	"github.com/aunali321/pi-go/llm"
 )
@@ -18,7 +17,6 @@ type weatherArgs struct {
 
 func main() {
 	ctx := context.Background()
-	env := env.NewOSEnv("")
 	repo := session.NewInMemorySessionRepo()
 	session, err := repo.Create("")
 	if err != nil {
@@ -42,9 +40,13 @@ func main() {
 	})
 
 	h, err := harness.NewAgentHarness(harness.AgentHarnessOptions{
-		Env: env, Session: session, Tools: []agent.Tool{tool}, Model: model,
-		SystemPrompt:  "You are a helpful assistant.",
-		GetAuth:       func(m *llm.Model) (*harness.Auth, error) { return &harness.Auth{APIKey: "dummy"}, nil },
+		Session: session, Tools: []agent.Tool{tool}, Model: model,
+		SystemPrompt: "You are a helpful assistant.",
+		Stream: func(ctx context.Context, m *llm.Model, reqCtx *llm.Context, opts *llm.StreamOptions) *llm.Stream {
+			o := *opts
+			o.APIKey = "dummy"
+			return llm.StreamSimple(ctx, m, reqCtx, &o)
+		},
 		StreamOptions: harness.HarnessStreamOptions{CacheRetention: llm.CacheShort, Headers: map[string]string{"x-client": "go"}},
 	})
 	if err != nil {

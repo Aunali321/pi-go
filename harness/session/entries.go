@@ -83,21 +83,35 @@ func (e ActiveToolsChangeEntry) MarshalJSON() ([]byte, error) {
 
 type CompactionEntry struct {
 	entryBase
-	Summary          string
+	Summary string
+	// FirstKeptEntryID is empty when retained history is stored directly on
+	// the entry as RetainedTail.
 	FirstKeptEntryID string
 	TokensBefore     int
-	Details          any
-	FromHook         bool
+	// RetainedTail holds recent messages retained after compaction.
+	RetainedTail []agent.AgentMessage
+	Details      any
+	// Usage from the LLM call(s) that generated the summary, if available.
+	Usage    *llm.Usage
+	FromHook bool
 }
 
 func (CompactionEntry) EntryType() string { return "compaction" }
 func (e CompactionEntry) MarshalJSON() ([]byte, error) {
 	m := baseMap("compaction", e.entryBase)
 	m["summary"] = e.Summary
-	m["firstKeptEntryId"] = e.FirstKeptEntryID
+	if e.FirstKeptEntryID != "" {
+		m["firstKeptEntryId"] = e.FirstKeptEntryID
+	}
 	m["tokensBefore"] = e.TokensBefore
+	if e.RetainedTail != nil {
+		m["retainedTail"] = e.RetainedTail
+	}
 	if e.Details != nil {
 		m["details"] = e.Details
+	}
+	if e.Usage != nil {
+		m["usage"] = e.Usage
 	}
 	if e.FromHook {
 		m["fromHook"] = true
@@ -107,9 +121,11 @@ func (e CompactionEntry) MarshalJSON() ([]byte, error) {
 
 type BranchSummaryEntry struct {
 	entryBase
-	FromID   string
-	Summary  string
-	Details  any
+	FromID  string
+	Summary string
+	Details any
+	// Usage from the LLM call that generated the summary, if available.
+	Usage    *llm.Usage
 	FromHook bool
 }
 
@@ -120,6 +136,9 @@ func (e BranchSummaryEntry) MarshalJSON() ([]byte, error) {
 	m["summary"] = e.Summary
 	if e.Details != nil {
 		m["details"] = e.Details
+	}
+	if e.Usage != nil {
+		m["usage"] = e.Usage
 	}
 	if e.FromHook {
 		m["fromHook"] = true
@@ -253,23 +272,34 @@ func decodeEntry(data []byte) (SessionTreeEntry, error) {
 		return ActiveToolsChangeEntry{base, v.ActiveToolNames}, nil
 	case "compaction":
 		var v struct {
-			Summary          string          `json:"summary"`
-			FirstKeptEntryID string          `json:"firstKeptEntryId"`
-			TokensBefore     int             `json:"tokensBefore"`
-			Details          json.RawMessage `json:"details"`
-			FromHook         bool            `json:"fromHook"`
+			Summary          string            `json:"summary"`
+			FirstKeptEntryID string            `json:"firstKeptEntryId"`
+			TokensBefore     int               `json:"tokensBefore"`
+			RetainedTail     []json.RawMessage `json:"retainedTail"`
+			Details          json.RawMessage   `json:"details"`
+			Usage            *llm.Usage        `json:"usage"`
+			FromHook         bool              `json:"fromHook"`
 		}
 		json.Unmarshal(data, &v)
-		return CompactionEntry{base, v.Summary, v.FirstKeptEntryID, v.TokensBefore, rawAny(v.Details), v.FromHook}, nil
+		var retainedTail []agent.AgentMessage
+		for _, raw := range v.RetainedTail {
+			msg, err := message.DecodeAgentMessage(raw)
+			if err != nil {
+				return nil, err
+			}
+			retainedTail = append(retainedTail, msg)
+		}
+		return CompactionEntry{base, v.Summary, v.FirstKeptEntryID, v.TokensBefore, retainedTail, rawAny(v.Details), v.Usage, v.FromHook}, nil
 	case "branch_summary":
 		var v struct {
 			FromID   string          `json:"fromId"`
 			Summary  string          `json:"summary"`
 			Details  json.RawMessage `json:"details"`
+			Usage    *llm.Usage      `json:"usage"`
 			FromHook bool            `json:"fromHook"`
 		}
 		json.Unmarshal(data, &v)
-		return BranchSummaryEntry{base, v.FromID, v.Summary, rawAny(v.Details), v.FromHook}, nil
+		return BranchSummaryEntry{base, v.FromID, v.Summary, rawAny(v.Details), v.Usage, v.FromHook}, nil
 	case "custom":
 		var v struct {
 			CustomType string          `json:"customType"`
@@ -348,4 +378,15 @@ type JsonlSessionMetadata struct {
 	Cwd               string
 	Path              string
 	ParentSessionPath string
+	// Metadata is arbitrary application data stored in the session header.
+	Metadata map[string]any
+}
+
+// SessionStats aggregates message counts and usage across all entries.
+type SessionStats struct {
+	MessageCount   int
+	CachedTokens   int
+	UncachedTokens int
+	TotalTokens    int
+	CostTotal      float64
 }

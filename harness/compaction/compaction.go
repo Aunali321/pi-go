@@ -50,6 +50,7 @@ func extractFileOpsFromMessage(message agent.AgentMessage, ops *FileOperations) 
 }
 
 func computeFileLists(ops *FileOperations) (readFiles, modifiedFiles []string) {
+	readFiles, modifiedFiles = []string{}, []string{}
 	modified := map[string]bool{}
 	for f := range ops.Edited {
 		modified[f] = true
@@ -179,6 +180,9 @@ func assistantUsage(msg agent.AgentMessage) (llm.Usage, bool) {
 		return llm.Usage{}, false
 	}
 	if am.StopReason == llm.StopAborted || am.StopReason == llm.StopError {
+		return llm.Usage{}, false
+	}
+	if calculateContextTokens(am.Usage) == 0 {
 		return llm.Usage{}, false
 	}
 	return am.Usage, true

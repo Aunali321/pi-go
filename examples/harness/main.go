@@ -45,10 +45,9 @@ func main() {
 	})
 
 	h, err := harness.NewAgentHarness(harness.AgentHarnessOptions{
-		Env: fsenv, Session: sess, Tools: []agent.Tool{weather},
+		Session: sess, Tools: []agent.Tool{weather},
 		SystemPrompt:  "Answer weather questions using the get_weather tool.",
 		Model:         &llm.Model{ID: "anthropic/claude-3.5-haiku", Input: []llm.InputModality{llm.InputText}, MaxTokens: 1024, ContextWindow: 200000},
-		GetAuth:       func(m *llm.Model) (*harness.Auth, error) { return &harness.Auth{APIKey: key}, nil },
 		StreamOptions: harness.HarnessStreamOptions{CacheRetention: llm.CacheShort},
 	})
 	if err != nil {

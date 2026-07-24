@@ -73,13 +73,14 @@ func TestHarnessEndToEndOpenRouter(t *testing.T) {
 	})
 
 	h, err := NewAgentHarness(AgentHarnessOptions{
-		Env:          fsenv,
 		Session:      sess,
 		Tools:        []agent.Tool{weather},
 		SystemPrompt: "You answer weather questions using the get_weather tool.",
 		Model:        model,
-		GetAuth: func(m *llm.Model) (*Auth, error) {
-			return &Auth{APIKey: key}, nil
+		Stream: func(ctx context.Context, m *llm.Model, reqCtx *llm.Context, opts *llm.StreamOptions) *llm.Stream {
+			o := *opts
+			o.APIKey = key
+			return llm.StreamSimple(ctx, m, reqCtx, &o)
 		},
 		StreamOptions: HarnessStreamOptions{CacheRetention: llm.CacheShort},
 	})

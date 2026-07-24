@@ -3,6 +3,8 @@ package session
 import (
 	"context"
 	"strings"
+
+	"github.com/aunali321/pi-go/llm"
 )
 
 // Metadata identifies a session.
@@ -14,6 +16,12 @@ type Metadata interface {
 func (m SessionMetadata) MetaID() string        { return m.ID }
 func (m SessionMetadata) MetaCreatedAt() string { return m.CreatedAt }
 
+// EntryCursor selects a slice of the entry log. Limit 0 means no limit.
+type EntryCursor struct {
+	AfterEntrySeq int
+	Limit         int
+}
+
 // SessionStorage is the append-only session-tree store backing a Session.
 type SessionStorage interface {
 	GetMetadata() Metadata
@@ -24,8 +32,13 @@ type SessionStorage interface {
 	GetEntry(id string) (SessionTreeEntry, bool)
 	FindEntries(typ string) []SessionTreeEntry
 	GetLabel(id string) (string, bool)
-	GetPathToRoot(leafID *string) ([]SessionTreeEntry, error)
-	GetEntries() []SessionTreeEntry
+	GetSessionName() string
+	GetSessionStats() SessionStats
+	// GetPathToRootOrCompaction walks from leaf to root but stops at the most
+	// recent effective compaction boundary: a compaction entry carrying a
+	// retained tail, or the first kept entry referenced by one.
+	GetPathToRootOrCompaction(leafID *string) ([]SessionTreeEntry, error)
+	GetEntries(cursor *EntryCursor) []SessionTreeEntry
 }
 
 func leafIDAfterEntry(entry SessionTreeEntry) *string {
@@ -60,7 +73,10 @@ func buildLabelsByID(entries []SessionTreeEntry) map[string]string {
 
 func generateEntryID(has func(string) bool) string {
 	for i := 0; i < 100; i++ {
-		id := UUIDv7()[:8]
+		// The uuidv7 prefix is timestamp-derived and nearly constant between
+		// calls, so short ids must come from the random tail.
+		full := UUIDv7()
+		id := full[len(full)-8:]
 		if !has(id) {
 			return id
 		}
@@ -68,7 +84,7 @@ func generateEntryID(has func(string) bool) string {
 	return UUIDv7()
 }
 
-func pathToRoot(byID map[string]SessionTreeEntry, leafID *string) ([]SessionTreeEntry, error) {
+func pathToRootOrCompaction(byID map[string]SessionTreeEntry, leafID *string) ([]SessionTreeEntry, error) {
 	if leafID == nil {
 		return nil, nil
 	}
@@ -77,8 +93,21 @@ func pathToRoot(byID map[string]SessionTreeEntry, leafID *string) ([]SessionTree
 		return nil, newSessionError(SessionNotFound, "Entry "+*leafID+" not found", nil)
 	}
 	var path []SessionTreeEntry
+	var stopAtEntryID *string
 	for {
 		path = append([]SessionTreeEntry{current}, path...)
+		if stopAtEntryID != nil && current.EntryID() == *stopAtEntryID {
+			break
+		}
+		if c, ok := current.(CompactionEntry); ok {
+			if c.RetainedTail != nil {
+				break
+			}
+			if c.FirstKeptEntryID != "" {
+				id := c.FirstKeptEntryID
+				stopAtEntryID = &id
+			}
+		}
 		parent := current.ParentID()
 		if parent == nil {
 			break
@@ -90,6 +119,54 @@ func pathToRoot(byID map[string]SessionTreeEntry, leafID *string) ([]SessionTree
 		current = next
 	}
 	return path, nil
+}
+
+func sessionNameFromEntries(entries []SessionTreeEntry) string {
+	name := ""
+	for _, e := range entries {
+		if info, ok := e.(SessionInfoEntry); ok {
+			name = info.Name
+		}
+	}
+	return strings.TrimSpace(name)
+}
+
+func sessionStatsFromEntries(entries []SessionTreeEntry) SessionStats {
+	var stats SessionStats
+	for _, e := range entries {
+		var usage *llm.Usage
+		switch entry := e.(type) {
+		case MessageEntry:
+			stats.MessageCount++
+			if am, ok := entry.Message.(*llm.AssistantMessage); ok {
+				usage = &am.Usage
+			}
+		case CompactionEntry:
+			usage = entry.Usage
+		case BranchSummaryEntry:
+			usage = entry.Usage
+		}
+		if usage == nil {
+			continue
+		}
+		stats.CachedTokens += usage.CacheRead
+		stats.UncachedTokens += usage.Input + usage.CacheWrite
+		stats.TotalTokens += usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
+		stats.CostTotal += usage.Cost.Total
+	}
+	return stats
+}
+
+func entriesSlice(entries []SessionTreeEntry, cursor *EntryCursor) []SessionTreeEntry {
+	start := 0
+	if cursor != nil {
+		start = min(cursor.AfterEntrySeq, len(entries))
+	}
+	end := len(entries)
+	if cursor != nil && cursor.Limit > 0 {
+		end = min(start+cursor.Limit, len(entries))
+	}
+	return append([]SessionTreeEntry{}, entries[start:end]...)
 }
 
 // InMemorySessionStorage keeps the session tree in memory.
@@ -182,10 +259,18 @@ func (s *InMemorySessionStorage) GetLabel(id string) (string, bool) {
 	return l, ok
 }
 
-func (s *InMemorySessionStorage) GetPathToRoot(leafID *string) ([]SessionTreeEntry, error) {
-	return pathToRoot(s.byID, leafID)
+func (s *InMemorySessionStorage) GetSessionName() string {
+	return sessionNameFromEntries(s.entries)
 }
 
-func (s *InMemorySessionStorage) GetEntries() []SessionTreeEntry {
-	return append([]SessionTreeEntry{}, s.entries...)
+func (s *InMemorySessionStorage) GetSessionStats() SessionStats {
+	return sessionStatsFromEntries(s.entries)
+}
+
+func (s *InMemorySessionStorage) GetPathToRootOrCompaction(leafID *string) ([]SessionTreeEntry, error) {
+	return pathToRootOrCompaction(s.byID, leafID)
+}
+
+func (s *InMemorySessionStorage) GetEntries(cursor *EntryCursor) []SessionTreeEntry {
+	return entriesSlice(s.entries, cursor)
 }

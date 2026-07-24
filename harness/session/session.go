@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"regexp"
 	"strings"
 
 	"github.com/aunali321/pi-go/agent"
@@ -9,11 +10,42 @@ import (
 	"github.com/aunali321/pi-go/llm"
 )
 
-func BuildSessionContext(pathEntries []SessionTreeEntry) SessionContext {
+// ContextEntryTransform rewrites the entry list used to build model context.
+type ContextEntryTransform func(entries []SessionTreeEntry) []SessionTreeEntry
+
+// CustomEntryProjector converts a custom entry into context messages. Custom
+// entries are omitted from model context by default.
+type CustomEntryProjector func(entry CustomEntry, index int, entries []SessionTreeEntry) []agent.AgentMessage
+
+// ContextBuildOptions customizes how session entries become model context.
+type ContextBuildOptions struct {
+	// EntryTransforms are applied after the default compaction transform.
+	EntryTransforms []ContextEntryTransform
+	// EntryProjectors project custom entries into context messages, keyed by
+	// custom type.
+	EntryProjectors map[string]CustomEntryProjector
+}
+
+func (o ContextBuildOptions) merge(other ContextBuildOptions) ContextBuildOptions {
+	merged := ContextBuildOptions{
+		EntryTransforms: append(append([]ContextEntryTransform{}, o.EntryTransforms...), other.EntryTransforms...),
+	}
+	if len(o.EntryProjectors) > 0 || len(other.EntryProjectors) > 0 {
+		merged.EntryProjectors = map[string]CustomEntryProjector{}
+		for k, v := range o.EntryProjectors {
+			merged.EntryProjectors[k] = v
+		}
+		for k, v := range other.EntryProjectors {
+			merged.EntryProjectors[k] = v
+		}
+	}
+	return merged
+}
+
+func deriveSessionContextState(pathEntries []SessionTreeEntry) SessionContext {
 	thinkingLevel := "off"
 	var model *ModelRef
 	var activeToolNames []string
-	var compaction *CompactionEntry
 
 	for _, entry := range pathEntries {
 		switch e := entry.(type) {
@@ -27,35 +59,38 @@ func BuildSessionContext(pathEntries []SessionTreeEntry) SessionContext {
 			}
 		case ActiveToolsChangeEntry:
 			activeToolNames = append([]string{}, e.ActiveToolNames...)
-		case CompactionEntry:
-			c := e
-			compaction = &c
 		}
 	}
+	return SessionContext{ThinkingLevel: thinkingLevel, Model: model, ActiveToolNames: activeToolNames}
+}
 
-	var messages []agent.AgentMessage
-	appendMessage := func(entry SessionTreeEntry) {
-		switch e := entry.(type) {
-		case MessageEntry:
-			messages = append(messages, e.Message)
-		case CustomMessageEntry:
-			messages = append(messages, message.CreateCustomMessage(e.CustomType, e.Content, e.Display, e.Details, ParseISO(e.Time)))
-		case BranchSummaryEntry:
-			if e.Summary != "" {
-				messages = append(messages, message.CreateBranchSummaryMessage(e.Summary, e.FromID, ParseISO(e.Time)))
-			}
+// DefaultContextEntryTransform collapses history behind the most recent
+// compaction entry: the compaction itself plus either its retained tail or
+// the entries from firstKeptEntryId onward.
+func DefaultContextEntryTransform(pathEntries []SessionTreeEntry) []SessionTreeEntry {
+	var compaction *CompactionEntry
+	for _, entry := range pathEntries {
+		if c, ok := entry.(CompactionEntry); ok {
+			cc := c
+			compaction = &cc
 		}
 	}
+	if compaction == nil {
+		return append([]SessionTreeEntry{}, pathEntries...)
+	}
 
-	if compaction != nil {
-		messages = append(messages, message.CreateCompactionSummaryMessage(compaction.Summary, compaction.TokensBefore, ParseISO(compaction.Time)))
-		compactionIdx := -1
-		for i, e := range pathEntries {
-			if e.EntryType() == "compaction" && e.EntryID() == compaction.ID {
-				compactionIdx = i
-				break
-			}
+	entries := []SessionTreeEntry{*compaction}
+	compactionIdx := -1
+	for i, e := range pathEntries {
+		if e.EntryType() == "compaction" && e.EntryID() == compaction.ID {
+			compactionIdx = i
+			break
 		}
+	}
+	if compaction.RetainedTail != nil {
+		return append(entries, pathEntries[compactionIdx+1:]...)
+	}
+	if compaction.FirstKeptEntryID != "" {
 		foundFirstKept := false
 		for i := 0; i < compactionIdx; i++ {
 			entry := pathEntries[i]
@@ -63,32 +98,78 @@ func BuildSessionContext(pathEntries []SessionTreeEntry) SessionContext {
 				foundFirstKept = true
 			}
 			if foundFirstKept {
-				appendMessage(entry)
+				entries = append(entries, entry)
 			}
 		}
-		for i := compactionIdx + 1; i < len(pathEntries); i++ {
-			appendMessage(pathEntries[i])
+	}
+	return append(entries, pathEntries[compactionIdx+1:]...)
+}
+
+// BuildContextEntries applies the default compaction transform followed by
+// any configured transforms.
+func BuildContextEntries(pathEntries []SessionTreeEntry, opts ContextBuildOptions) []SessionTreeEntry {
+	entries := DefaultContextEntryTransform(pathEntries)
+	for _, transform := range opts.EntryTransforms {
+		entries = append([]SessionTreeEntry{}, transform(entries)...)
+	}
+	return entries
+}
+
+// SessionEntryToContextMessages converts one context entry into its model
+// context messages.
+func SessionEntryToContextMessages(entry SessionTreeEntry, index int, entries []SessionTreeEntry, opts ContextBuildOptions) []agent.AgentMessage {
+	switch e := entry.(type) {
+	case MessageEntry:
+		return []agent.AgentMessage{e.Message}
+	case CustomMessageEntry:
+		return []agent.AgentMessage{message.CreateCustomMessage(e.CustomType, e.Content, e.Display, e.Details, ParseISO(e.Time))}
+	case CompactionEntry:
+		msgs := []agent.AgentMessage{message.CreateCompactionSummaryMessage(e.Summary, e.TokensBefore, ParseISO(e.Time))}
+		return append(msgs, e.RetainedTail...)
+	case BranchSummaryEntry:
+		if e.Summary != "" {
+			return []agent.AgentMessage{message.CreateBranchSummaryMessage(e.Summary, e.FromID, ParseISO(e.Time))}
 		}
-	} else {
-		for _, entry := range pathEntries {
-			appendMessage(entry)
+	case CustomEntry:
+		if projector, ok := opts.EntryProjectors[e.CustomType]; ok {
+			return projector(e, index, entries)
 		}
 	}
+	return nil
+}
 
-	return SessionContext{Messages: messages, ThinkingLevel: thinkingLevel, Model: model, ActiveToolNames: activeToolNames}
+func BuildSessionContext(pathEntries []SessionTreeEntry, opts ContextBuildOptions) SessionContext {
+	state := deriveSessionContextState(pathEntries)
+	contextEntries := BuildContextEntries(pathEntries, opts)
+	var messages []agent.AgentMessage
+	for i, entry := range contextEntries {
+		messages = append(messages, SessionEntryToContextMessages(entry, i, contextEntries, opts)...)
+	}
+	state.Messages = messages
+	return state
 }
 
 // Session is a high-level view over a SessionStorage.
 type Session struct {
-	storage SessionStorage
+	storage      SessionStorage
+	buildOptions ContextBuildOptions
 }
 
-func NewSession(storage SessionStorage) *Session { return &Session{storage} }
+func NewSession(storage SessionStorage) *Session { return &Session{storage: storage} }
 
-func (s *Session) GetMetadata() Metadata          { return s.storage.GetMetadata() }
-func (s *Session) GetStorage() SessionStorage     { return s.storage }
-func (s *Session) GetLeafID() (*string, error)    { return s.storage.GetLeafID() }
-func (s *Session) GetEntries() []SessionTreeEntry { return s.storage.GetEntries() }
+// NewSessionWithOptions constructs a Session with default context build
+// options applied to every BuildContext call.
+func NewSessionWithOptions(storage SessionStorage, opts ContextBuildOptions) *Session {
+	return &Session{storage: storage, buildOptions: opts}
+}
+
+func (s *Session) GetMetadata() Metadata       { return s.storage.GetMetadata() }
+func (s *Session) GetStorage() SessionStorage  { return s.storage }
+func (s *Session) GetLeafID() (*string, error) { return s.storage.GetLeafID() }
+
+func (s *Session) GetEntries(cursor *EntryCursor) []SessionTreeEntry {
+	return s.storage.GetEntries(cursor)
+}
 
 func (s *Session) GetEntry(id string) (SessionTreeEntry, bool) { return s.storage.GetEntry(id) }
 
@@ -101,30 +182,35 @@ func (s *Session) GetBranch(fromID *string) ([]SessionTreeEntry, error) {
 		}
 		leafID = l
 	}
-	return s.storage.GetPathToRoot(leafID)
+	return s.storage.GetPathToRootOrCompaction(leafID)
+}
+
+// BuildContextEntries returns the entry list model context is built from.
+func (s *Session) BuildContextEntries(opts ContextBuildOptions) ([]SessionTreeEntry, error) {
+	branch, err := s.GetBranch(nil)
+	if err != nil {
+		return nil, err
+	}
+	return BuildContextEntries(branch, s.buildOptions.merge(opts)), nil
 }
 
 func (s *Session) BuildContext() (SessionContext, error) {
+	return s.BuildContextWithOptions(ContextBuildOptions{})
+}
+
+func (s *Session) BuildContextWithOptions(opts ContextBuildOptions) (SessionContext, error) {
 	branch, err := s.GetBranch(nil)
 	if err != nil {
 		return SessionContext{}, err
 	}
-	return BuildSessionContext(branch), nil
+	return BuildSessionContext(branch, s.buildOptions.merge(opts)), nil
 }
 
 func (s *Session) GetLabel(id string) (string, bool) { return s.storage.GetLabel(id) }
 
-func (s *Session) GetSessionName() string {
-	entries := s.storage.FindEntries("session_info")
-	for i := len(entries) - 1; i >= 0; i-- {
-		if e, ok := entries[i].(SessionInfoEntry); ok {
-			if name := strings.TrimSpace(e.Name); name != "" {
-				return name
-			}
-		}
-	}
-	return ""
-}
+func (s *Session) GetSessionStats() SessionStats { return s.storage.GetSessionStats() }
+
+func (s *Session) GetSessionName() string { return s.storage.GetSessionName() }
 
 func (s *Session) base(parent *string) entryBase {
 	return entryBase{ID: s.storage.CreateEntryID(), Parent: parent, Time: nowISO()}
@@ -171,12 +257,25 @@ func (s *Session) AppendActiveToolsChange(ctx context.Context, names []string) (
 	return s.appendTyped(ctx, ActiveToolsChangeEntry{s.base(leaf), append([]string{}, names...)})
 }
 
-func (s *Session) AppendCompaction(ctx context.Context, summary, firstKeptEntryID string, tokensBefore int, details any, fromHook bool) (string, error) {
+// CompactionInput carries the fields of a compaction entry to append.
+type CompactionInput struct {
+	Summary          string
+	FirstKeptEntryID string
+	TokensBefore     int
+	RetainedTail     []agent.AgentMessage
+	Details          any
+	Usage            *llm.Usage
+	FromHook         bool
+}
+
+func (s *Session) AppendCompaction(ctx context.Context, in CompactionInput) (string, error) {
 	leaf, err := s.leaf()
 	if err != nil {
 		return "", err
 	}
-	return s.appendTyped(ctx, CompactionEntry{s.base(leaf), summary, firstKeptEntryID, tokensBefore, details, fromHook})
+	return s.appendTyped(ctx, CompactionEntry{
+		s.base(leaf), in.Summary, in.FirstKeptEntryID, in.TokensBefore, in.RetainedTail, in.Details, in.Usage, in.FromHook,
+	})
 }
 
 func (s *Session) AppendCustomEntry(ctx context.Context, customType string, data any) (string, error) {
@@ -206,12 +305,15 @@ func (s *Session) AppendLabel(ctx context.Context, targetID string, label *strin
 	return s.appendTyped(ctx, LabelEntry{s.base(leaf), targetID, label})
 }
 
+var sessionNameNewlines = regexp.MustCompile(`[\r\n]+`)
+
 func (s *Session) AppendSessionName(ctx context.Context, name string) (string, error) {
 	leaf, err := s.leaf()
 	if err != nil {
 		return "", err
 	}
-	return s.appendTyped(ctx, SessionInfoEntry{s.base(leaf), strings.TrimSpace(name)})
+	sanitized := strings.TrimSpace(sessionNameNewlines.ReplaceAllString(name, " "))
+	return s.appendTyped(ctx, SessionInfoEntry{s.base(leaf), sanitized})
 }
 
 // MoveTo sets the active leaf, optionally recording a branch summary.
@@ -231,7 +333,7 @@ func (s *Session) MoveTo(ctx context.Context, entryID *string, summary *BranchSu
 	if entryID != nil {
 		fromID = *entryID
 	}
-	entry := BranchSummaryEntry{entryBase{ID: s.storage.CreateEntryID(), Parent: entryID, Time: nowISO()}, fromID, summary.Summary, summary.Details, summary.FromHook}
+	entry := BranchSummaryEntry{entryBase{ID: s.storage.CreateEntryID(), Parent: entryID, Time: nowISO()}, fromID, summary.Summary, summary.Details, summary.Usage, summary.FromHook}
 	id, err := s.appendTyped(ctx, entry)
 	if err != nil {
 		return nil, err
@@ -242,5 +344,6 @@ func (s *Session) MoveTo(ctx context.Context, entryID *string, summary *BranchSu
 type BranchSummaryInput struct {
 	Summary  string
 	Details  any
+	Usage    *llm.Usage
 	FromHook bool
 }

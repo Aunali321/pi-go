@@ -10,12 +10,13 @@ import (
 )
 
 type sessionHeader struct {
-	Type          string `json:"type"`
-	Version       int    `json:"version"`
-	ID            string `json:"id"`
-	Timestamp     string `json:"timestamp"`
-	Cwd           string `json:"cwd"`
-	ParentSession string `json:"parentSession,omitempty"`
+	Type          string         `json:"type"`
+	Version       int            `json:"version"`
+	ID            string         `json:"id"`
+	Timestamp     string         `json:"timestamp"`
+	Cwd           string         `json:"cwd"`
+	ParentSession string         `json:"parentSession,omitempty"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
 }
 
 func invalidSession(path, msg string, cause error) *SessionError {
@@ -69,6 +70,7 @@ func headerToMetadata(h sessionHeader, path string) JsonlSessionMetadata {
 		Cwd:               h.Cwd,
 		Path:              path,
 		ParentSessionPath: h.ParentSession,
+		Metadata:          h.Metadata,
 	}
 }
 
@@ -147,8 +149,8 @@ func OpenJsonlSessionStorage(ctx context.Context, fs env.FileSystem, path string
 	return newJsonlStorage(fs, path, h, entries, leafID), nil
 }
 
-func CreateJsonlSessionStorage(ctx context.Context, fs env.FileSystem, path string, cwd, sessionID, parentSessionPath string) (*JsonlSessionStorage, error) {
-	h := sessionHeader{Type: "session", Version: 3, ID: sessionID, Timestamp: nowISO(), Cwd: cwd, ParentSession: parentSessionPath}
+func CreateJsonlSessionStorage(ctx context.Context, fs env.FileSystem, path string, cwd, sessionID, parentSessionPath string, metadata map[string]any) (*JsonlSessionStorage, error) {
+	h := sessionHeader{Type: "session", Version: 3, ID: sessionID, Timestamp: nowISO(), Cwd: cwd, ParentSession: parentSessionPath, Metadata: metadata}
 	line, _ := json.Marshal(h)
 	if err := fs.WriteFile(ctx, path, append(line, '\n')); err != nil {
 		if _, e := fileSystemResultOrThrow[any](nil, err, "Failed to create session "+path); e != nil {
@@ -236,10 +238,18 @@ func (s *JsonlSessionStorage) GetLabel(id string) (string, bool) {
 	return l, ok
 }
 
-func (s *JsonlSessionStorage) GetPathToRoot(leafID *string) ([]SessionTreeEntry, error) {
-	return pathToRoot(s.byID, leafID)
+func (s *JsonlSessionStorage) GetSessionName() string {
+	return sessionNameFromEntries(s.entries)
 }
 
-func (s *JsonlSessionStorage) GetEntries() []SessionTreeEntry {
-	return append([]SessionTreeEntry{}, s.entries...)
+func (s *JsonlSessionStorage) GetSessionStats() SessionStats {
+	return sessionStatsFromEntries(s.entries)
+}
+
+func (s *JsonlSessionStorage) GetPathToRootOrCompaction(leafID *string) ([]SessionTreeEntry, error) {
+	return pathToRootOrCompaction(s.byID, leafID)
+}
+
+func (s *JsonlSessionStorage) GetEntries(cursor *EntryCursor) []SessionTreeEntry {
+	return entriesSlice(s.entries, cursor)
 }

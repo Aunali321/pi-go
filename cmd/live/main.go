@@ -99,11 +99,8 @@ func main() {
 			},
 		})
 		h, err := harness.NewAgentHarness(harness.AgentHarnessOptions{
-			Env: env, Session: sess, Tools: []agent.Tool{tool}, Model: mkModel(),
-			SystemPrompt: "You MUST call the get_weather tool to answer any weather question, then give a one-sentence answer.",
-			GetAuth: func(m *llm.Model) (*harness.Auth, error) {
-				return &harness.Auth{APIKey: os.Getenv("OPENROUTER_API_KEY")}, nil
-			},
+			Session: sess, Tools: []agent.Tool{tool}, Model: mkModel(),
+			SystemPrompt:  "You MUST call the get_weather tool to answer any weather question, then give a one-sentence answer.",
 			StreamOptions: harness.HarnessStreamOptions{CacheRetention: llm.CacheShort},
 		})
 		must(err)
@@ -126,11 +123,8 @@ func main() {
 			},
 		})
 		h, err := harness.NewAgentHarness(harness.AgentHarnessOptions{
-			Env: env, Session: sess, Tools: []agent.Tool{tool}, Model: mkModel(),
-			SystemPrompt: "You MUST call the get_weather tool to answer any weather question, then give a one-sentence answer.",
-			GetAuth: func(m *llm.Model) (*harness.Auth, error) {
-				return &harness.Auth{APIKey: os.Getenv("OPENROUTER_API_KEY")}, nil
-			},
+			Session: sess, Tools: []agent.Tool{tool}, Model: mkModel(),
+			SystemPrompt:  "You MUST call the get_weather tool to answer any weather question, then give a one-sentence answer.",
 			StreamOptions: harness.HarnessStreamOptions{CacheRetention: llm.CacheShort},
 		})
 		must(err)
@@ -141,7 +135,7 @@ func main() {
 		must(err)
 		meta := sess.GetMetadata().(session.JsonlSessionMetadata)
 		sctx, _ := sess.BuildContext()
-		emit(map[string]any{"impl": "go", "path": meta.Path, "thinkingLevel": sctx.ThinkingLevel, "entryTypes": entryTypes(sess.GetEntries()), "roles": roles(sctx.Messages)})
+		emit(map[string]any{"impl": "go", "path": meta.Path, "thinkingLevel": sctx.ThinkingLevel, "entryTypes": entryTypes(sess.GetEntries(nil)), "roles": roles(sctx.Messages)})
 
 	case "run3":
 		sessionsRoot := os.Args[2]
@@ -156,11 +150,8 @@ func main() {
 			},
 		})
 		h, err := harness.NewAgentHarness(harness.AgentHarnessOptions{
-			Env: env, Session: sess, Tools: []agent.Tool{tool}, Model: mkModel(),
-			SystemPrompt: "You MUST call the get_weather tool to answer any weather question, then give a one-sentence answer.",
-			GetAuth: func(m *llm.Model) (*harness.Auth, error) {
-				return &harness.Auth{APIKey: os.Getenv("OPENROUTER_API_KEY")}, nil
-			},
+			Session: sess, Tools: []agent.Tool{tool}, Model: mkModel(),
+			SystemPrompt:  "You MUST call the get_weather tool to answer any weather question, then give a one-sentence answer.",
 			StreamOptions: harness.HarnessStreamOptions{CacheRetention: llm.CacheShort},
 		})
 		must(err)
@@ -172,7 +163,7 @@ func main() {
 		must(h.SetActiveTools(ctx, []string{"get_weather"}))
 		meta := sess.GetMetadata().(session.JsonlSessionMetadata)
 		sctx, _ := sess.BuildContext()
-		emit(map[string]any{"impl": "go", "path": meta.Path, "model": modelOut(sctx.Model), "entryTypes": entryTypes(sess.GetEntries()), "roles": roles(sctx.Messages)})
+		emit(map[string]any{"impl": "go", "path": meta.Path, "model": modelOut(sctx.Model), "entryTypes": entryTypes(sess.GetEntries(nil)), "roles": roles(sctx.Messages)})
 
 	case "imgpayload":
 		raw, err := os.ReadFile(os.Args[2])
@@ -203,11 +194,8 @@ func main() {
 		sess, err := repo.Create(ctx, session.JsonlCreateOptions{Cwd: env.Cwd()})
 		must(err)
 		h, err := harness.NewAgentHarness(harness.AgentHarnessOptions{
-			Env: env, Session: sess, Model: visionModel(),
-			SystemPrompt: "You are a helpful assistant. Describe images concisely.",
-			GetAuth: func(m *llm.Model) (*harness.Auth, error) {
-				return &harness.Auth{APIKey: os.Getenv("OPENROUTER_API_KEY")}, nil
-			},
+			Session: sess, Model: visionModel(),
+			SystemPrompt:  "You are a helpful assistant. Describe images concisely.",
 			StreamOptions: harness.HarnessStreamOptions{CacheRetention: llm.CacheNone},
 		})
 		must(err)
@@ -233,11 +221,8 @@ func main() {
 		sess, err := repo.Create(ctx, session.JsonlCreateOptions{Cwd: env.Cwd()})
 		must(err)
 		h, err := harness.NewAgentHarness(harness.AgentHarnessOptions{
-			Env: env, Session: sess, Tools: []agent.Tool{tool}, Model: mkModel(),
-			SystemPrompt: "You MUST use the read_file tool to read files. Then answer.",
-			GetAuth: func(m *llm.Model) (*harness.Auth, error) {
-				return &harness.Auth{APIKey: os.Getenv("OPENROUTER_API_KEY")}, nil
-			},
+			Session: sess, Tools: []agent.Tool{tool}, Model: mkModel(),
+			SystemPrompt:  "You MUST use the read_file tool to read files. Then answer.",
 			StreamOptions: harness.HarnessStreamOptions{CacheRetention: llm.CacheNone},
 		})
 		must(err)
@@ -293,11 +278,8 @@ func main() {
 		})
 
 		h, err := harness.NewAgentHarness(harness.AgentHarnessOptions{
-			Env: env, Session: sess, Tools: []agent.Tool{tool}, Model: mkModel(),
-			SystemPrompt: "You must use the provided tools to answer. Always call the tool when asked.",
-			GetAuth: func(m *llm.Model) (*harness.Auth, error) {
-				return &harness.Auth{APIKey: os.Getenv("OPENROUTER_API_KEY")}, nil
-			},
+			Session: sess, Tools: []agent.Tool{tool}, Model: mkModel(),
+			SystemPrompt:  "You must use the provided tools to answer. Always call the tool when asked.",
 			StreamOptions: harness.HarnessStreamOptions{CacheRetention: llm.CacheNone},
 		})
 		must(err)
@@ -344,7 +326,7 @@ func main() {
 		sess := session.NewSession(storage)
 		sctx, err := sess.BuildContext()
 		must(err)
-		emit(map[string]any{"impl": "go-read", "thinkingLevel": sctx.ThinkingLevel, "model": modelOut(sctx.Model), "entryTypes": entryTypes(sess.GetEntries()), "roles": roles(sctx.Messages), "summary": summarize(sctx.Messages)})
+		emit(map[string]any{"impl": "go-read", "thinkingLevel": sctx.ThinkingLevel, "model": modelOut(sctx.Model), "entryTypes": entryTypes(sess.GetEntries(nil)), "roles": roles(sctx.Messages), "summary": summarize(sctx.Messages)})
 	}
 }
 

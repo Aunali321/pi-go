@@ -9,7 +9,6 @@ import (
 
 	"github.com/aunali321/pi-go/agent"
 	"github.com/aunali321/pi-go/harness"
-	"github.com/aunali321/pi-go/harness/env"
 	"github.com/aunali321/pi-go/harness/session"
 	"github.com/aunali321/pi-go/llm"
 )
@@ -46,15 +45,13 @@ func main() {
 		},
 	})
 
-	fsenv := env.NewOSEnv("")
 	repo := session.NewInMemorySessionRepo()
 	sess, _ := repo.Create("")
 
 	h, err := harness.NewAgentHarness(harness.AgentHarnessOptions{
-		Env: fsenv, Session: sess, Tools: []agent.Tool{weather, add},
+		Session: sess, Tools: []agent.Tool{weather, add},
 		SystemPrompt:  "Use the provided tools. Call each tool that the question requires.",
 		Model:         &llm.Model{ID: "anthropic/claude-3.5-haiku", Input: []llm.InputModality{llm.InputText}, MaxTokens: 1024, ContextWindow: 200000},
-		GetAuth:       func(m *llm.Model) (*harness.Auth, error) { return &harness.Auth{APIKey: key}, nil },
 		StreamOptions: harness.HarnessStreamOptions{CacheRetention: llm.CacheShort},
 	})
 	if err != nil {
