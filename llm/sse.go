@@ -32,14 +32,20 @@ type sseDelta struct {
 }
 
 type sseToolCall struct {
-	Index    *int     `json:"index"`
-	ID       string   `json:"id"`
-	Function *sseFunc `json:"function"`
+	Index    *int       `json:"index"`
+	ID       string     `json:"id"`
+	Function *sseFunc   `json:"function"`
+	Custom   *sseCustom `json:"custom"`
 }
 
 type sseFunc struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
+}
+
+type sseCustom struct {
+	Name  string `json:"name"`
+	Input string `json:"input"`
 }
 
 type rawUsage struct {
@@ -50,76 +56,148 @@ type rawUsage struct {
 		CachedTokens     int `json:"cached_tokens"`
 		CacheWriteTokens int `json:"cache_write_tokens"`
 	} `json:"prompt_tokens_details"`
+	CompletionTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
 }
 
-func consumeSSE(ctx context.Context, body io.Reader, model *Model, stream *Stream, output *AssistantMessage) error {
-	var textBlock *Text
-	var thinkingBlock *Thinking
-	hasFinish := false
-	byIndex := map[int]*ToolCall{}
-	byID := map[string]*ToolCall{}
+// sseState carries the per-stream parsing state shared between consumeSSE and
+// handleChunk.
+type sseState struct {
+	model        *Model
+	stream       *Stream
+	output       *AssistantMessage
+	grammarProps map[string]string
 
-	indexOf := func(target Content) int {
-		for i, c := range output.Content {
-			if c == target {
-				return i
-			}
-		}
-		return -1
-	}
+	textBlock     *Text
+	thinkingBlock *Thinking
+	hasFinish     bool
+	byIndex       map[int]*ToolCall
+	byID          map[string]*ToolCall
+	// pendingSignatures buffers encrypted reasoning details whose tool call
+	// has not streamed yet, keyed by tool call id.
+	pendingSignatures map[string]string
+}
 
-	ensureText := func() *Text {
-		if textBlock == nil {
-			textBlock = &Text{}
-			output.Content = append(output.Content, textBlock)
-			stream.push(TextStartEvent{baseEvent{output}, indexOf(textBlock)})
+func (s *sseState) indexOf(target Content) int {
+	for i, c := range s.output.Content {
+		if c == target {
+			return i
 		}
-		return textBlock
 	}
-	ensureThinking := func(sig string) *Thinking {
-		if thinkingBlock == nil {
-			thinkingBlock = &Thinking{Signature: sig}
-			output.Content = append(output.Content, thinkingBlock)
-			stream.push(ThinkingStartEvent{baseEvent{output}, indexOf(thinkingBlock)})
+	return -1
+}
+
+func (s *sseState) ensureText() *Text {
+	if s.textBlock == nil {
+		s.textBlock = &Text{}
+		s.output.Content = append(s.output.Content, s.textBlock)
+		s.stream.push(TextStartEvent{baseEvent{s.output}, s.indexOf(s.textBlock)})
+	}
+	return s.textBlock
+}
+
+func (s *sseState) ensureThinking(sig string) *Thinking {
+	if s.thinkingBlock == nil {
+		s.thinkingBlock = &Thinking{Signature: sig}
+		s.output.Content = append(s.output.Content, s.thinkingBlock)
+		s.stream.push(ThinkingStartEvent{baseEvent{s.output}, s.indexOf(s.thinkingBlock)})
+	}
+	return s.thinkingBlock
+}
+
+func (s *sseState) applyPendingSignature(block *ToolCall) {
+	if block.ID == "" {
+		return
+	}
+	if sig, ok := s.pendingSignatures[block.ID]; ok {
+		block.ThoughtSignature = sig
+		delete(s.pendingSignatures, block.ID)
+	}
+}
+
+func (s *sseState) initCustomInput(block *ToolCall) {
+	prop, ok := s.grammarProps[block.Name]
+	if !ok {
+		// The model called a grammar tool we do not know about; stash the
+		// input under a fallback property so it is not lost.
+		prop = "input"
+	}
+	block.Arguments = map[string]any{prop: ""}
+	block.customProp = prop
+	block.customBuf = &grammarInputBuffer{}
+	block.partialArgs = ""
+}
+
+func (s *sseState) ensureToolCall(tc sseToolCall) *ToolCall {
+	var block *ToolCall
+	if tc.Index != nil {
+		block = s.byIndex[*tc.Index]
+	}
+	if block == nil && tc.ID != "" {
+		block = s.byID[tc.ID]
+	}
+	name := ""
+	if tc.Function != nil {
+		name = tc.Function.Name
+	}
+	if name == "" && tc.Custom != nil {
+		name = tc.Custom.Name
+	}
+	if block == nil {
+		block = &ToolCall{ID: tc.ID, Name: name, Arguments: map[string]any{}}
+		if tc.Custom != nil {
+			s.initCustomInput(block)
 		}
-		return thinkingBlock
-	}
-	ensureToolCall := func(tc sseToolCall) *ToolCall {
-		var block *ToolCall
 		if tc.Index != nil {
-			block = byIndex[*tc.Index]
-		}
-		if block == nil && tc.ID != "" {
-			block = byID[tc.ID]
-		}
-		if block == nil {
-			block = &ToolCall{Arguments: map[string]any{}}
-			if tc.ID != "" {
-				block.ID = tc.ID
-			}
-			if tc.Function != nil {
-				block.Name = tc.Function.Name
-			}
-			if tc.Index != nil {
-				block.streamIndex = *tc.Index
-				block.hasIndex = true
-				byIndex[*tc.Index] = block
-			}
-			if tc.ID != "" {
-				byID[tc.ID] = block
-			}
-			output.Content = append(output.Content, block)
-			stream.push(ToolCallStartEvent{baseEvent{output}, indexOf(block)})
-		}
-		if tc.Index != nil && !block.hasIndex {
 			block.streamIndex = *tc.Index
 			block.hasIndex = true
-			byIndex[*tc.Index] = block
+			s.byIndex[*tc.Index] = block
 		}
-		if tc.ID != "" {
-			byID[tc.ID] = block
-		}
-		return block
+		s.output.Content = append(s.output.Content, block)
+		s.stream.push(ToolCallStartEvent{baseEvent{s.output}, s.indexOf(block)})
+	}
+	if tc.Index != nil && !block.hasIndex {
+		block.streamIndex = *tc.Index
+		block.hasIndex = true
+		s.byIndex[*tc.Index] = block
+	}
+	if tc.ID != "" {
+		s.byID[tc.ID] = block
+	}
+	if block.Name == "" && name != "" {
+		block.Name = name
+	}
+	if tc.Custom != nil && block.customBuf == nil {
+		s.initCustomInput(block)
+	}
+	s.applyPendingSignature(block)
+	return block
+}
+
+// appendCustomInput advances a grammar tool call to nextInput and returns the
+// synthesized JSON delta (ok reports whether one was produced).
+func appendCustomInput(block *ToolCall, nextInput string, close bool) (string, bool, error) {
+	if block.customBuf == nil {
+		return "", false, nil
+	}
+	delta, ok, err := appendGrammarInputDelta(block.customBuf, block.customProp, nextInput, close)
+	if err != nil {
+		return "", false, err
+	}
+	block.Arguments = map[string]any{block.customProp: nextInput}
+	return delta, ok, nil
+}
+
+func consumeSSE(ctx context.Context, body io.Reader, model *Model, grammarProps map[string]string, stream *Stream, output *AssistantMessage) error {
+	state := &sseState{
+		model:             model,
+		stream:            stream,
+		output:            output,
+		grammarProps:      grammarProps,
+		byIndex:           map[int]*ToolCall{},
+		byID:              map[string]*ToolCall{},
+		pendingSignatures: map[string]string{},
 	}
 
 	reader := bufio.NewReader(body)
@@ -135,8 +213,8 @@ func consumeSSE(ctx context.Context, body io.Reader, model *Model, stream *Strea
 				if data != "" {
 					var chunk sseChunk
 					if json.Unmarshal([]byte(data), &chunk) == nil {
-						if done := handleChunk(&chunk, model, stream, output, ensureText, ensureThinking, ensureToolCall, indexOf); done {
-							hasFinish = true
+						if err := handleChunk(&chunk, state); err != nil {
+							return err
 						}
 					}
 				}
@@ -151,7 +229,9 @@ func consumeSSE(ctx context.Context, body io.Reader, model *Model, stream *Strea
 	}
 
 	for _, c := range output.Content {
-		finishBlock(c, stream, output, indexOf)
+		if err := finishBlock(c, state); err != nil {
+			return err
+		}
 	}
 
 	if ctx.Err() != nil {
@@ -166,7 +246,7 @@ func consumeSSE(ctx context.Context, body io.Reader, model *Model, stream *Strea
 		}
 		return fmt.Errorf("provider returned an error stop reason")
 	}
-	if !hasFinish {
+	if !state.hasFinish {
 		return fmt.Errorf("stream ended without finish_reason")
 	}
 
@@ -174,31 +254,23 @@ func consumeSSE(ctx context.Context, body io.Reader, model *Model, stream *Strea
 	return nil
 }
 
-func handleChunk(
-	chunk *sseChunk,
-	model *Model,
-	stream *Stream,
-	output *AssistantMessage,
-	ensureText func() *Text,
-	ensureThinking func(string) *Thinking,
-	ensureToolCall func(sseToolCall) *ToolCall,
-	indexOf func(Content) int,
-) (hasFinish bool) {
+func handleChunk(chunk *sseChunk, s *sseState) error {
+	output := s.output
 	if output.ResponseID == "" {
 		output.ResponseID = chunk.ID
 	}
-	if chunk.Model != "" && chunk.Model != model.ID && output.ResponseModel == "" {
+	if chunk.Model != "" && chunk.Model != s.model.ID && output.ResponseModel == "" {
 		output.ResponseModel = chunk.Model
 	}
 	if chunk.Usage != nil {
-		output.Usage = parseUsage(chunk.Usage, model)
+		output.Usage = parseUsage(chunk.Usage, s.model)
 	}
 	if len(chunk.Choices) == 0 {
-		return false
+		return nil
 	}
 	choice := chunk.Choices[0]
 	if chunk.Usage == nil && choice.Usage != nil {
-		output.Usage = parseUsage(choice.Usage, model)
+		output.Usage = parseUsage(choice.Usage, s.model)
 	}
 
 	if choice.FinishReason != nil {
@@ -207,42 +279,49 @@ func handleChunk(
 		if errMsg != "" {
 			output.ErrorMessage = errMsg
 		}
-		hasFinish = true
+		s.hasFinish = true
 	}
 
 	d := choice.Delta
 	if d.Content != nil && *d.Content != "" {
-		block := ensureText()
+		block := s.ensureText()
 		block.Text += *d.Content
-		stream.push(TextDeltaEvent{baseEvent{output}, indexOf(block), *d.Content})
+		s.stream.push(TextDeltaEvent{baseEvent{output}, s.indexOf(block), *d.Content})
 	}
 
 	reasoning, field := firstReasoning(d)
 	if reasoning != "" {
 		sig := field
-		if model.provider() == "opencode-go" && field == "reasoning" {
+		if s.model.provider() == "opencode-go" && field == "reasoning" {
 			sig = "reasoning_content"
 		}
-		block := ensureThinking(sig)
+		block := s.ensureThinking(sig)
 		block.Thinking += reasoning
-		stream.push(ThinkingDeltaEvent{baseEvent{output}, indexOf(block), reasoning})
+		s.stream.push(ThinkingDeltaEvent{baseEvent{output}, s.indexOf(block), reasoning})
 	}
 
 	for _, tc := range d.ToolCalls {
-		block := ensureToolCall(tc)
+		block := s.ensureToolCall(tc)
 		if block.ID == "" && tc.ID != "" {
 			block.ID = tc.ID
-		}
-		if block.Name == "" && tc.Function != nil && tc.Function.Name != "" {
-			block.Name = tc.Function.Name
+			s.byID[tc.ID] = block
 		}
 		delta := ""
 		if tc.Function != nil && tc.Function.Arguments != "" {
 			delta = tc.Function.Arguments
 			block.partialArgs += tc.Function.Arguments
 			block.Arguments = parseStreamingJSON(block.partialArgs)
+		} else if tc.Custom != nil && tc.Custom.Input != "" {
+			next := block.customBuf.input + tc.Custom.Input
+			d, ok, err := appendCustomInput(block, next, false)
+			if err != nil {
+				return err
+			}
+			if ok {
+				delta = d
+			}
 		}
-		stream.push(ToolCallDeltaEvent{baseEvent{output}, indexOf(block), delta})
+		s.stream.push(ToolCallDeltaEvent{baseEvent{output}, s.indexOf(block), delta})
 	}
 
 	for _, raw := range d.ReasoningDetails {
@@ -254,17 +333,17 @@ func handleChunk(
 		if json.Unmarshal(raw, &head) != nil {
 			continue
 		}
-		if head.Type == "reasoning.encrypted" && head.ID != "" && len(head.Data) > 0 && string(head.Data) != "null" {
-			for _, c := range output.Content {
-				if tc, ok := c.(*ToolCall); ok && tc.ID == head.ID {
-					tc.ThoughtSignature = string(raw)
-					break
-				}
+		// Data must be a non-empty JSON string, matching the TS type guard.
+		if head.Type == "reasoning.encrypted" && head.ID != "" && len(head.Data) > 2 && head.Data[0] == '"' {
+			if block, ok := s.byID[head.ID]; ok {
+				block.ThoughtSignature = string(raw)
+			} else {
+				s.pendingSignatures[head.ID] = string(raw)
 			}
 		}
 	}
 
-	return hasFinish
+	return nil
 }
 
 func firstReasoning(d sseDelta) (text, field string) {
@@ -279,22 +358,37 @@ func firstReasoning(d sseDelta) (text, field string) {
 	return "", ""
 }
 
-func finishBlock(block Content, stream *Stream, output *AssistantMessage, indexOf func(Content) int) {
-	idx := indexOf(block)
+func finishBlock(block Content, s *sseState) error {
+	idx := s.indexOf(block)
 	if idx == -1 {
-		return
+		return nil
 	}
 	switch b := block.(type) {
 	case *Text:
-		stream.push(TextEndEvent{baseEvent{output}, idx, b.Text})
+		s.stream.push(TextEndEvent{baseEvent{s.output}, idx, b.Text})
 	case *Thinking:
-		stream.push(ThinkingEndEvent{baseEvent{output}, idx, b.Thinking})
+		s.stream.push(ThinkingEndEvent{baseEvent{s.output}, idx, b.Thinking})
 	case *ToolCall:
-		b.Arguments = parseStreamingJSON(b.partialArgs)
+		if b.customBuf != nil {
+			delta, ok, err := appendCustomInput(b, b.customBuf.input, true)
+			if err != nil {
+				return err
+			}
+			if ok {
+				s.stream.push(ToolCallDeltaEvent{baseEvent{s.output}, idx, delta})
+			}
+		} else {
+			b.Arguments = parseStreamingJSON(b.partialArgs)
+		}
+		// Finalize in-place and strip the scratch buffers so replay only
+		// carries parsed arguments.
 		b.partialArgs = ""
 		b.hasIndex = false
-		stream.push(ToolCallEndEvent{baseEvent{output}, idx, b})
+		b.customProp = ""
+		b.customBuf = nil
+		s.stream.push(ToolCallEndEvent{baseEvent{s.output}, idx, b})
 	}
+	return nil
 }
 
 func parseUsage(raw *rawUsage, model *Model) Usage {
@@ -310,11 +404,16 @@ func parseUsage(raw *rawUsage, model *Model) Usage {
 	if input < 0 {
 		input = 0
 	}
+	reasoning := 0
+	if raw.CompletionTokensDetails != nil {
+		reasoning = raw.CompletionTokensDetails.ReasoningTokens
+	}
 	u := Usage{
 		Input:       input,
 		Output:      raw.CompletionTokens,
 		CacheRead:   cacheRead,
 		CacheWrite:  cacheWrite,
+		Reasoning:   &reasoning,
 		TotalTokens: input + raw.CompletionTokens + cacheRead + cacheWrite,
 	}
 	calculateCost(model, &u)

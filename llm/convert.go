@@ -7,22 +7,43 @@ import (
 
 const apiOpenAICompletions = "openai-completions"
 
+func sanitizeIDChars(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
 func normalizeToolCallID(m *Model, id string) string {
-	if strings.Contains(id, "|") {
-		callID, _, _ := strings.Cut(id, "|")
-		var b strings.Builder
-		for _, r := range callID {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
-				b.WriteRune(r)
-			} else {
-				b.WriteByte('_')
-			}
+	// Handle IDs like {call_id}|{id} where {id} can be 400+ chars with special
+	// chars (+, /, =). These come from providers like github-copilot,
+	// openai-codex, opencode. Multiple tool calls in the same turn can share
+	// call_id but differ by item_id, so preserve item-level uniqueness when
+	// replaying into Chat Completions, which requires distinct tool call ids.
+	if callID, itemID, found := strings.Cut(id, "|"); found {
+		callID = sanitizeIDChars(callID)
+		itemID = sanitizeIDChars(itemID)
+		combined := callID
+		if itemID != "" {
+			combined = callID + "_" + itemID
 		}
-		s := b.String()
-		if len(s) > 40 {
-			s = s[:40]
+		if len(combined) <= 40 {
+			return combined
 		}
-		return s
+		hash := shortHash(id)
+		if len(hash) > 8 {
+			hash = hash[:8]
+		}
+		prefix := callID
+		if n := max(1, 40-len(hash)-1); len(prefix) > n {
+			prefix = prefix[:n]
+		}
+		return prefix + "_" + hash
 	}
 	if m.provider() == "openai" && len(id) > 40 {
 		return id[:40]
@@ -34,7 +55,7 @@ func imageDataURL(img *Image) string {
 	return "data:" + img.MimeType + ";base64," + img.Data
 }
 
-func convertMessages(m *Model, ctx *Context, compat resolvedCompat) []map[string]any {
+func convertMessages(m *Model, ctx *Context, compat resolvedCompat, grammarProps map[string]string) ([]map[string]any, error) {
 	transformed := transformMessages(ctx.Messages, m, func(id string) string {
 		return normalizeToolCallID(m, id)
 	})
@@ -134,14 +155,29 @@ func convertMessages(m *Model, ctx *Context, compat resolvedCompat) []map[string
 				calls := make([]map[string]any, len(tcs))
 				var details []any
 				for i, tc := range tcs {
-					args, _ := json.Marshal(tc.Arguments)
-					calls[i] = map[string]any{
-						"id":   tc.ID,
-						"type": "function",
-						"function": map[string]any{
-							"name":      tc.Name,
-							"arguments": string(args),
-						},
+					if prop, ok := grammarProps[tc.Name]; ok {
+						input, err := getGrammarToolInput(tc.Name, tc.Arguments, prop)
+						if err != nil {
+							return nil, err
+						}
+						calls[i] = map[string]any{
+							"id":   tc.ID,
+							"type": "custom",
+							"custom": map[string]any{
+								"name":  tc.Name,
+								"input": sanitizeSurrogates(input),
+							},
+						}
+					} else {
+						args, _ := json.Marshal(tc.Arguments)
+						calls[i] = map[string]any{
+							"id":   tc.ID,
+							"type": "function",
+							"function": map[string]any{
+								"name":      tc.Name,
+								"arguments": string(args),
+							},
+						}
 					}
 					if tc.ThoughtSignature != "" {
 						var d any
@@ -178,6 +214,8 @@ func convertMessages(m *Model, ctx *Context, compat resolvedCompat) []map[string
 
 		case *ToolResultMessage:
 			var imageBlocks []map[string]any
+			var deferredNames []string
+			deferredSeen := map[string]bool{}
 			j := i
 			for ; j < len(transformed); j++ {
 				tr, ok := transformed[j].(*ToolResultMessage)
@@ -194,10 +232,13 @@ func convertMessages(m *Model, ctx *Context, compat resolvedCompat) []map[string
 						hasImages = true
 					}
 				}
-				textResult := strings.Join(texts, "\n")
-				content := textResult
+				content := strings.Join(texts, "\n")
 				if content == "" {
-					content = "(see attached image)"
+					if hasImages {
+						content = "(see attached image)"
+					} else {
+						content = "(no tool output)"
+					}
 				}
 				toolMsg := map[string]any{
 					"role":         "tool",
@@ -208,6 +249,15 @@ func convertMessages(m *Model, ctx *Context, compat resolvedCompat) []map[string
 					toolMsg["name"] = tr.ToolName
 				}
 				params = append(params, toolMsg)
+
+				if compat.deferredToolsMode == DeferredToolsKimi {
+					for _, name := range tr.AddedToolNames {
+						if !deferredSeen[name] {
+							deferredSeen[name] = true
+							deferredNames = append(deferredNames, name)
+						}
+					}
+				}
 
 				if hasImages && m.supportsImageInput() {
 					for _, c := range tr.Content {
@@ -230,30 +280,96 @@ func convertMessages(m *Model, ctx *Context, compat resolvedCompat) []map[string
 			} else {
 				lastRole = "toolResult"
 			}
+
+			if len(deferredNames) > 0 {
+				deferredTools := toolsByName(ctx.Tools, deferredNames)
+				if len(deferredTools) > 0 {
+					converted, err := convertTools(deferredTools, compat)
+					if err != nil {
+						return nil, err
+					}
+					// Kimi accepts a system message carrying tool definitions
+					// but omitting the standard content field.
+					params = append(params, map[string]any{"role": "system", "tools": converted})
+				}
+			}
 			continue
 		}
 
 		lastRole = msg.Role()
 	}
 
-	return params
+	return params, nil
 }
 
-func convertTools(tools []Tool, compat resolvedCompat) []map[string]any {
+func convertTools(tools []Tool, compat resolvedCompat) ([]map[string]any, error) {
 	out := make([]map[string]any, len(tools))
 	for i, t := range tools {
+		grammar, err := resolveGrammarSampling(t, compat.supportsOpenAIGrammarTools)
+		if err != nil {
+			return nil, err
+		}
+		if grammar != nil {
+			out[i] = map[string]any{
+				"type": "custom",
+				"custom": map[string]any{
+					"name":        t.Name,
+					"description": t.Description,
+					"format": map[string]any{
+						"type": "grammar",
+						"grammar": map[string]any{
+							"syntax":     grammar.format,
+							"definition": grammar.definition,
+						},
+					},
+				},
+			}
+			continue
+		}
+
+		strict, err := resolveJSONSchemaStrict(t, compat.supportsStrictMode)
+		if err != nil {
+			return nil, err
+		}
 		fn := map[string]any{
 			"name":        t.Name,
 			"description": t.Description,
 			"parameters":  t.Parameters,
 		}
-		tool := map[string]any{"type": "function", "function": fn}
+		// Only include strict if the provider supports it; some reject
+		// unknown fields.
 		if compat.supportsStrictMode {
-			fn["strict"] = false
+			fn["strict"] = strict
 		}
-		out[i] = tool
+		out[i] = map[string]any{"type": "function", "function": fn}
+	}
+	return out, nil
+}
+
+func toolsByName(tools []Tool, names []string) []Tool {
+	byName := make(map[string]Tool, len(tools))
+	for _, t := range tools {
+		byName[t.Name] = t
+	}
+	var out []Tool
+	for _, name := range names {
+		if t, ok := byName[name]; ok {
+			out = append(out, t)
+		}
 	}
 	return out
+}
+
+func deferredToolNames(messages []Message) map[string]bool {
+	names := map[string]bool{}
+	for _, msg := range messages {
+		if tr, ok := msg.(*ToolResultMessage); ok {
+			for _, name := range tr.AddedToolNames {
+				names[name] = true
+			}
+		}
+	}
+	return names
 }
 
 func hasToolHistory(messages []Message) bool {

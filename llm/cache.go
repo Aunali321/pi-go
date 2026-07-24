@@ -35,7 +35,7 @@ func cacheLastTool(tools []map[string]any, cc map[string]any) {
 
 func cacheLastConversationMessage(messages []map[string]any, cc map[string]any) {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if role, _ := messages[i]["role"].(string); role == "user" || role == "assistant" {
+		if role, _ := messages[i]["role"].(string); role == "user" || role == "assistant" || role == "tool" {
 			if cacheTextContent(messages[i], cc) {
 				return
 			}

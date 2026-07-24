@@ -36,6 +36,11 @@ type ToolCall struct {
 	partialArgs string
 	streamIndex int
 	hasIndex    bool
+
+	// Grammar (custom) tool call streaming state: the argument property that
+	// carries the raw input and the synthesized-JSON delta buffer.
+	customProp string
+	customBuf  *grammarInputBuffer
 }
 
 func (*ToolCall) isContent() {}

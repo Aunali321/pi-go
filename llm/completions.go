@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
@@ -19,10 +18,21 @@ type StreamOptions struct {
 	APIKey         string
 	CacheRetention CacheRetention
 	SessionID      string
-	Headers        map[string]string
-	Timeout        time.Duration
-	Reasoning      ThinkingLevel
-	ToolChoice     any
+	// Headers are merged over provider defaults; an empty value suppresses a
+	// default header with the same name.
+	Headers map[string]string
+	Timeout time.Duration
+	// MaxRetries bounds transport-level retries of the initial request
+	// (default 0). Failures mid-stream are not retried at this layer.
+	MaxRetries int
+	// MaxRetryDelay caps server-requested retry delays. Zero means the 60s
+	// default; negative disables the cap.
+	MaxRetryDelay time.Duration
+	// Env holds request-scoped environment overrides that take precedence
+	// over the process environment for provider configuration.
+	Env        map[string]string
+	Reasoning  ThinkingLevel
+	ToolChoice any
 
 	// OnPayload may inspect or replace the request body before sending. Return
 	// nil to keep the payload unchanged.
@@ -31,6 +41,21 @@ type StreamOptions struct {
 	OnResponse func(status int, headers map[string]string)
 
 	reasoningEffort ThinkingLevel
+}
+
+const (
+	contextSafetyTokens = 4096
+	minMaxTokens        = 1
+)
+
+// clampMaxTokensToContext bounds maxTokens so the request fits the model's
+// context window, leaving a safety margin.
+func clampMaxTokensToContext(m *Model, ctx *Context, maxTokens int) int {
+	if m.ContextWindow <= 0 {
+		return max(minMaxTokens, maxTokens)
+	}
+	available := m.ContextWindow - EstimateContextTokens(ctx).Tokens - contextSafetyTokens
+	return min(maxTokens, max(minMaxTokens, available))
 }
 
 // StreamSimple issues a streaming chat-completions request and returns a Stream.
@@ -42,8 +67,13 @@ func StreamSimple(ctx context.Context, model *Model, reqCtx *Context, opts *Stre
 	}
 	o := *opts
 	if o.APIKey == "" {
-		o.APIKey = envAPIKey(model.provider())
+		o.APIKey = envAPIKey(model.provider(), o.Env)
 	}
+	maxTokens := o.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = model.MaxTokens
+	}
+	o.MaxTokens = clampMaxTokensToContext(model, reqCtx, maxTokens)
 	if o.Reasoning != "" {
 		clamped := ClampThinkingLevel(model, o.Reasoning)
 		if clamped != ThinkingOff {
@@ -58,11 +88,11 @@ func CompleteSimple(ctx context.Context, model *Model, reqCtx *Context, opts *St
 	return StreamSimple(ctx, model, reqCtx, opts).Result()
 }
 
-func resolveCacheRetention(r CacheRetention) CacheRetention {
+func resolveCacheRetention(r CacheRetention, env map[string]string) CacheRetention {
 	if r != "" {
 		return r
 	}
-	if os.Getenv("PI_CACHE_RETENTION") == "long" {
+	if providerEnvValue("PI_CACHE_RETENTION", env) == "long" {
 		return CacheLong
 	}
 	return CacheShort
@@ -108,6 +138,8 @@ func streamOpenAICompletions(ctx context.Context, model *Model, reqCtx *Context,
 				if tc, ok := c.(*ToolCall); ok {
 					tc.partialArgs = ""
 					tc.hasIndex = false
+					tc.customProp = ""
+					tc.customBuf = nil
 				}
 			}
 			if ctx.Err() != nil {
@@ -124,14 +156,67 @@ func streamOpenAICompletions(ctx context.Context, model *Model, reqCtx *Context,
 	return stream
 }
 
+func hasHeaderValue(headers map[string]string, name string) bool {
+	for k, v := range headers {
+		if strings.EqualFold(k, name) && strings.TrimSpace(v) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// clientAPIKey resolves the request API key. A caller-supplied Authorization
+// (or Cloudflare gateway auth) header stands in for a key.
+func clientAPIKey(provider string, opts *StreamOptions) (string, error) {
+	if opts.APIKey != "" {
+		return opts.APIKey, nil
+	}
+	if hasHeaderValue(opts.Headers, "authorization") || hasHeaderValue(opts.Headers, "cf-aig-authorization") {
+		return "unused", nil
+	}
+	return "", fmt.Errorf("No API key for provider: %s", provider)
+}
+
+// requestHeaders merges provider defaults, session-affinity headers and
+// caller overrides. An empty caller value suppresses the header entirely.
+func requestHeaders(model *Model, opts *StreamOptions, compat resolvedCompat, retention CacheRetention) map[string]string {
+	headers := make(map[string]string, len(model.Headers)+len(opts.Headers)+3)
+	for k, v := range model.Headers {
+		headers[k] = v
+	}
+	if opts.SessionID != "" && compat.sendSessionAffinityHeaders && retention != CacheNone {
+		if compat.sessionAffinityFormat == SessionAffinityOpenRouter {
+			headers["x-session-id"] = opts.SessionID
+		} else {
+			if compat.sessionAffinityFormat == SessionAffinityOpenAI {
+				headers["session_id"] = opts.SessionID
+			}
+			headers["x-client-request-id"] = opts.SessionID
+			headers["x-session-affinity"] = opts.SessionID
+		}
+	}
+	for k, v := range opts.Headers {
+		headers[k] = v
+	}
+	return headers
+}
+
 func runCompletion(ctx context.Context, model *Model, reqCtx *Context, opts *StreamOptions, stream *Stream, output *AssistantMessage) error {
-	if opts.APIKey == "" {
-		return fmt.Errorf("no API key for provider: %s", model.provider())
+	apiKey, err := clientAPIKey(model.provider(), opts)
+	if err != nil {
+		return err
 	}
 
 	compat := getCompat(model)
-	retention := resolveCacheRetention(opts.CacheRetention)
-	params := buildParams(model, reqCtx, opts, compat, retention)
+	grammarProps, err := grammarInputProperties(reqCtx.Tools, compat.supportsOpenAIGrammarTools)
+	if err != nil {
+		return err
+	}
+	retention := resolveCacheRetention(opts.CacheRetention, opts.Env)
+	params, err := buildParams(model, reqCtx, opts, compat, retention, grammarProps)
+	if err != nil {
+		return err
+	}
 
 	if opts.OnPayload != nil {
 		if replaced := opts.OnPayload(params); replaced != nil {
@@ -143,78 +228,121 @@ func runCompletion(ctx context.Context, model *Model, reqCtx *Context, opts *Str
 	if err != nil {
 		return err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, model.baseURL()+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+opts.APIKey)
-	for k, v := range model.Headers {
-		req.Header.Set(k, v)
-	}
-	if opts.SessionID != "" && compat.sendSessionAffinityHeaders && retention != CacheNone {
-		req.Header.Set("session_id", opts.SessionID)
-		req.Header.Set("x-client-request-id", opts.SessionID)
-		req.Header.Set("x-session-affinity", opts.SessionID)
-	}
-	for k, v := range opts.Headers {
-		req.Header.Set(k, v)
-	}
+	headers := requestHeaders(model, opts, compat, retention)
 
 	client := &http.Client{}
 	if opts.Timeout > 0 {
 		client.Timeout = opts.Timeout
 	}
 
-	resp, err := client.Do(req)
+	resp, err := retryProviderRequest(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, model.baseURL()+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		for k, v := range headers {
+			if v == "" {
+				req.Header.Del(k)
+			} else {
+				req.Header.Set(k, v)
+			}
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode/100 != 2 {
+			defer resp.Body.Close()
+			return nil, httpError(resp)
+		}
+		return resp, nil
+	}, opts.MaxRetries, opts.MaxRetryDelay)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if opts.OnResponse != nil {
-		headers := make(map[string]string, len(resp.Header))
+		respHeaders := make(map[string]string, len(resp.Header))
 		for k := range resp.Header {
-			headers[k] = resp.Header.Get(k)
+			respHeaders[k] = resp.Header.Get(k)
 		}
-		opts.OnResponse(resp.StatusCode, headers)
-	}
-
-	if resp.StatusCode/100 != 2 {
-		return httpError(resp)
+		opts.OnResponse(resp.StatusCode, respHeaders)
 	}
 
 	stream.push(StartEvent{baseEvent{output}})
-	return consumeSSE(ctx, resp.Body, model, stream, output)
+	return consumeSSE(ctx, resp.Body, model, grammarProps, stream, output)
 }
 
+const maxProviderErrorBodyChars = 4000
+
+func truncateErrorText(text string, maxChars int) string {
+	if len(text) <= maxChars {
+		return text
+	}
+	return fmt.Sprintf("%s... [truncated %d chars]", text[:maxChars], len(text)-maxChars)
+}
+
+// httpError formats a non-2xx provider response the way pi's
+// normalizeProviderError/formatProviderError render OpenAI SDK errors:
+// "<status>: <error body JSON>" when the body carries an error object with a
+// message, the SDK-style "<status> <body>" otherwise.
 func httpError(resp *http.Response) error {
 	data, _ := io.ReadAll(resp.Body)
-	msg := fmt.Sprintf("request failed: %s", resp.Status)
+	status := resp.StatusCode
+
+	var message string
+	var errField json.RawMessage
 	var parsed struct {
-		Error struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(data, &parsed) == nil {
+		errField = parsed.Error
+	}
+
+	switch {
+	case len(errField) > 0 && errField[0] == '{' && string(errField) != "{}":
+		var buf bytes.Buffer
+		if json.Compact(&buf, errField) != nil {
+			buf.Reset()
+			buf.Write(errField)
+		}
+		bodyJSON := truncateErrorText(buf.String(), maxProviderErrorBodyChars)
+		var inner struct {
 			Message  string `json:"message"`
 			Metadata struct {
 				Raw string `json:"raw"`
 			} `json:"metadata"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(data, &parsed) == nil {
-		if parsed.Error.Message != "" {
-			msg = parsed.Error.Message
 		}
-		if parsed.Error.Metadata.Raw != "" {
-			msg += "\n" + parsed.Error.Metadata.Raw
+		_ = json.Unmarshal(errField, &inner)
+		if inner.Message != "" {
+			message = fmt.Sprintf("%d: %s", status, bodyJSON)
+		} else {
+			message = fmt.Sprintf("%d %s", status, bodyJSON)
 		}
-	} else if len(data) > 0 {
-		msg += ": " + string(data)
+		// Some providers via OpenRouter give additional information in this
+		// field; only append it when the body did not already surface it.
+		if inner.Metadata.Raw != "" && !strings.Contains(message, inner.Metadata.Raw) {
+			message += "\n" + inner.Metadata.Raw
+		}
+	case len(errField) > 0 && string(errField) != "null":
+		message = fmt.Sprintf("%d %s", status, string(errField))
+	case strings.TrimSpace(string(data)) != "":
+		message = fmt.Sprintf("%d %s", status, string(data))
+	default:
+		message = fmt.Sprintf("%d status code (no body)", status)
 	}
-	return fmt.Errorf("%s", msg)
+
+	return &providerHTTPError{status: status, headers: resp.Header, message: message}
 }
 
-func buildParams(model *Model, reqCtx *Context, opts *StreamOptions, compat resolvedCompat, retention CacheRetention) map[string]any {
-	messages := convertMessages(model, reqCtx, compat)
+func buildParams(model *Model, reqCtx *Context, opts *StreamOptions, compat resolvedCompat, retention CacheRetention, grammarProps map[string]string) (map[string]any, error) {
+	messages, err := convertMessages(model, reqCtx, compat, grammarProps)
+	if err != nil {
+		return nil, err
+	}
 
 	params := map[string]any{
 		"model":    model.ID,
@@ -245,11 +373,30 @@ func buildParams(model *Model, reqCtx *Context, opts *StreamOptions, compat reso
 		params["temperature"] = *opts.Temperature
 	}
 
+	deferred := map[string]bool{}
+	if compat.deferredToolsMode == DeferredToolsKimi {
+		deferred = deferredToolNames(reqCtx.Messages)
+	}
+	var activeTools []Tool
+	for _, t := range reqCtx.Tools {
+		if !deferred[t.Name] {
+			activeTools = append(activeTools, t)
+		}
+	}
+
 	var tools []map[string]any
-	if len(reqCtx.Tools) > 0 {
-		tools = convertTools(reqCtx.Tools, compat)
+	if len(activeTools) > 0 {
+		tools, err = convertTools(activeTools, compat)
+		if err != nil {
+			return nil, err
+		}
 		params["tools"] = tools
+		if compat.zaiToolStream {
+			params["tool_stream"] = true
+		}
 	} else if hasToolHistory(reqCtx.Messages) {
+		// Anthropic (via LiteLLM/proxy) requires the tools param when the
+		// conversation has tool_calls/tool_results.
 		tools = []map[string]any{}
 		params["tools"] = tools
 	}
@@ -264,11 +411,61 @@ func buildParams(model *Model, reqCtx *Context, opts *StreamOptions, compat reso
 
 	applyReasoning(model, opts, compat, params)
 
-	if strings.Contains(baseURL, "openrouter.ai") && compat.openRouterRouting != nil {
+	if compat.openRouterRouting != nil {
 		params["provider"] = compat.openRouterRouting
 	}
+	if routing := compat.vercelGatewayRouting; routing != nil && (len(routing.Only) > 0 || len(routing.Order) > 0) {
+		gateway := map[string]any{}
+		if len(routing.Only) > 0 {
+			gateway["only"] = routing.Only
+		}
+		if len(routing.Order) > 0 {
+			gateway["order"] = routing.Order
+		}
+		params["providerOptions"] = map[string]any{"gateway": gateway}
+	}
 
-	return params
+	return params, nil
+}
+
+func resolveChatTemplateKwarg(m *Model, effort ThinkingLevel, kw ChatTemplateKwarg) (any, bool) {
+	if kw.Var == "" {
+		return kw.Value, true
+	}
+	if effort == "" && kw.OmitWhenOff {
+		return nil, false
+	}
+	if kw.Var == "thinking.enabled" {
+		return effort != "", true
+	}
+
+	level := effort
+	if effort == "" {
+		level = ThinkingOff
+	}
+	if m.NullLevels[level] {
+		return nil, false
+	}
+	if v, ok := m.ThinkingLevelMap[level]; ok {
+		return v, true
+	}
+	if effort == "" {
+		return nil, false
+	}
+	return string(effort), true
+}
+
+func buildChatTemplateKwargs(m *Model, effort ThinkingLevel, compat resolvedCompat) map[string]any {
+	kwargs := map[string]any{}
+	for key, kw := range compat.chatTemplateKwargs {
+		if v, ok := resolveChatTemplateKwarg(m, effort, kw); ok {
+			kwargs[key] = v
+		}
+	}
+	if len(kwargs) == 0 {
+		return nil
+	}
+	return kwargs
 }
 
 func applyReasoning(model *Model, opts *StreamOptions, compat resolvedCompat, params map[string]any) {
@@ -277,6 +474,8 @@ func applyReasoning(model *Model, opts *StreamOptions, compat resolvedCompat, pa
 	}
 	effort := opts.reasoningEffort
 	on := effort != ""
+	// mapped mirrors TS `thinkingLevelMap?.[level] ?? level`: both a missing
+	// and an explicit null entry fall back to the level itself.
 	mapped := func(level ThinkingLevel) string {
 		if v, ok := model.ThinkingLevelMap[level]; ok {
 			return v
@@ -285,16 +484,38 @@ func applyReasoning(model *Model, opts *StreamOptions, compat resolvedCompat, pa
 	}
 
 	switch compat.thinkingFormat {
-	case ThinkingFormatZAI, ThinkingFormatQwen:
-		params["enable_thinking"] = on
-	case ThinkingFormatDeepSeek:
+	case ThinkingFormatZAI:
 		if on {
-			params["thinking"] = map[string]any{"type": "enabled"}
-			params["reasoning_effort"] = mapped(effort)
+			params["thinking"] = map[string]any{"type": "enabled", "clear_thinking": false}
 		} else {
 			params["thinking"] = map[string]any{"type": "disabled"}
 		}
+		if on && compat.supportsReasoningEffort && !model.NullLevels[effort] {
+			params["reasoning_effort"] = mapped(effort)
+		}
+	case ThinkingFormatQwen:
+		params["enable_thinking"] = on
+	case ThinkingFormatQwenChatTemplate:
+		params["chat_template_kwargs"] = map[string]any{
+			"enable_thinking":   on,
+			"preserve_thinking": true,
+		}
+	case ThinkingFormatChatTemplate:
+		if kwargs := buildChatTemplateKwargs(model, effort, compat); kwargs != nil {
+			params["chat_template_kwargs"] = kwargs
+		}
+	case ThinkingFormatDeepSeek:
+		if on {
+			params["thinking"] = map[string]any{"type": "enabled"}
+		} else if !model.NullLevels[ThinkingOff] {
+			params["thinking"] = map[string]any{"type": "disabled"}
+		}
+		if on && compat.supportsReasoningEffort {
+			params["reasoning_effort"] = mapped(effort)
+		}
 	case ThinkingFormatOpenRouter:
+		// OpenRouter normalizes reasoning across providers via a nested
+		// reasoning object.
 		if on {
 			params["reasoning"] = map[string]any{"effort": mapped(effort)}
 		} else if !model.NullLevels[ThinkingOff] {
@@ -304,10 +525,27 @@ func applyReasoning(model *Model, opts *StreamOptions, compat resolvedCompat, pa
 			}
 			params["reasoning"] = map[string]any{"effort": offVal}
 		}
+	case ThinkingFormatAntLing:
+		// Sent only when the model maps this effort to an explicit value.
+		if on {
+			if v, ok := model.ThinkingLevelMap[effort]; ok {
+				params["reasoning"] = map[string]any{"effort": v}
+			}
+		}
 	case ThinkingFormatTogether:
 		params["reasoning"] = map[string]any{"enabled": on}
 		if on && compat.supportsReasoningEffort {
 			params["reasoning_effort"] = mapped(effort)
+		}
+	case ThinkingFormatStringThinking:
+		if on {
+			params["thinking"] = mapped(effort)
+		} else if !model.NullLevels[ThinkingOff] {
+			offVal := "none"
+			if v, ok := model.ThinkingLevelMap[ThinkingOff]; ok {
+				offVal = v
+			}
+			params["thinking"] = offVal
 		}
 	default:
 		if !compat.supportsReasoningEffort {
@@ -315,7 +553,7 @@ func applyReasoning(model *Model, opts *StreamOptions, compat resolvedCompat, pa
 		}
 		if on {
 			params["reasoning_effort"] = mapped(effort)
-		} else if v, ok := model.ThinkingLevelMap[ThinkingOff]; ok && v != "" {
+		} else if v, ok := model.ThinkingLevelMap[ThinkingOff]; ok {
 			params["reasoning_effort"] = v
 		}
 	}

@@ -9,6 +9,7 @@ const (
 	ThinkingMedium  ThinkingLevel = "medium"
 	ThinkingHigh    ThinkingLevel = "high"
 	ThinkingXHigh   ThinkingLevel = "xhigh"
+	ThinkingMax     ThinkingLevel = "max"
 )
 
 type CacheRetention string
@@ -20,10 +21,23 @@ const (
 )
 
 type Pricing struct {
+	Input      float64 // $/million tokens
+	Output     float64
+	CacheRead  float64
+	CacheWrite float64
+	// Tiers holds request-wide pricing tiers. The highest matching input
+	// threshold applies to the full request.
+	Tiers []PricingTier
+}
+
+type PricingTier struct {
 	Input      float64
 	Output     float64
 	CacheRead  float64
 	CacheWrite float64
+	// InputTokensAbove selects this tier for requests whose total input usage
+	// (input + cacheRead + cacheWrite) exceeds this token count.
+	InputTokensAbove int
 }
 
 type Model struct {
@@ -90,16 +104,53 @@ type OpenRouterRouting struct {
 	Sort              string   `json:"sort,omitempty"`
 }
 
+type VercelGatewayRouting struct {
+	Only  []string `json:"only,omitempty"`
+	Order []string `json:"order,omitempty"`
+}
+
 type ThinkingFormat string
 
 const (
-	ThinkingFormatOpenAI     ThinkingFormat = "openai"
-	ThinkingFormatOpenRouter ThinkingFormat = "openrouter"
-	ThinkingFormatDeepSeek   ThinkingFormat = "deepseek"
-	ThinkingFormatTogether   ThinkingFormat = "together"
-	ThinkingFormatZAI        ThinkingFormat = "zai"
-	ThinkingFormatQwen       ThinkingFormat = "qwen"
+	ThinkingFormatOpenAI           ThinkingFormat = "openai"
+	ThinkingFormatOpenRouter       ThinkingFormat = "openrouter"
+	ThinkingFormatDeepSeek         ThinkingFormat = "deepseek"
+	ThinkingFormatTogether         ThinkingFormat = "together"
+	ThinkingFormatZAI              ThinkingFormat = "zai"
+	ThinkingFormatQwen             ThinkingFormat = "qwen"
+	ThinkingFormatQwenChatTemplate ThinkingFormat = "qwen-chat-template"
+	ThinkingFormatChatTemplate     ThinkingFormat = "chat-template"
+	ThinkingFormatStringThinking   ThinkingFormat = "string-thinking"
+	ThinkingFormatAntLing          ThinkingFormat = "ant-ling"
 )
+
+// SessionAffinityFormat selects which session-affinity headers are sent from
+// StreamOptions.SessionID: "openai" sends session_id, x-client-request-id and
+// x-session-affinity; "openai-nosession" drops session_id; "openrouter" sends
+// x-session-id.
+type SessionAffinityFormat string
+
+const (
+	SessionAffinityOpenAI          SessionAffinityFormat = "openai"
+	SessionAffinityOpenAINoSession SessionAffinityFormat = "openai-nosession"
+	SessionAffinityOpenRouter      SessionAffinityFormat = "openrouter"
+)
+
+// DeferredToolsKimi is the only provider-specific deferred tool serialization
+// mode: tools named by ToolResultMessage.AddedToolNames are dropped from the
+// request tools param and replayed as Kimi system messages carrying tool
+// definitions at their load point.
+const DeferredToolsKimi = "kimi"
+
+// ChatTemplateKwarg is one chat_template_kwargs value for the "chat-template"
+// thinking format: either a literal (string, number, bool or nil) or a
+// reference to a pi-controlled thinking variable.
+type ChatTemplateKwarg struct {
+	Value any
+	// Var is "thinking.enabled" or "thinking.effort"; when set, Value is ignored.
+	Var         string
+	OmitWhenOff bool
+}
 
 type CacheControlFormat string
 
@@ -118,10 +169,16 @@ type Compat struct {
 	RequiresThinkingAsText              *bool
 	RequiresReasoningContentOnAssistant *bool
 	ThinkingFormat                      ThinkingFormat
+	ChatTemplateKwargs                  map[string]ChatTemplateKwarg
 	OpenRouterRouting                   *OpenRouterRouting
+	VercelGatewayRouting                *VercelGatewayRouting
+	ZaiToolStream                       *bool
+	SupportsOpenAIGrammarTools          *bool
 	SupportsStrictMode                  *bool
 	CacheControlFormat                  CacheControlFormat
 	SendSessionAffinityHeaders          *bool
+	DeferredToolsMode                   string
+	SessionAffinityFormat               SessionAffinityFormat
 	SupportsLongCacheRetention          *bool
 }
 
@@ -136,9 +193,15 @@ type resolvedCompat struct {
 	requiresThinkingAsText              bool
 	requiresReasoningContentOnAssistant bool
 	thinkingFormat                      ThinkingFormat
+	chatTemplateKwargs                  map[string]ChatTemplateKwarg
 	openRouterRouting                   *OpenRouterRouting
+	vercelGatewayRouting                *VercelGatewayRouting
+	zaiToolStream                       bool
+	supportsOpenAIGrammarTools          bool
 	supportsStrictMode                  bool
 	cacheControlFormat                  CacheControlFormat
 	sendSessionAffinityHeaders          bool
+	deferredToolsMode                   string
+	sessionAffinityFormat               SessionAffinityFormat
 	supportsLongCacheRetention          bool
 }

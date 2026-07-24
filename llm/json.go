@@ -1,10 +1,57 @@
 package llm
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
+
+// jsonStringInner escapes s the way JS JSON.stringify does (no HTML
+// escaping), without the surrounding quotes.
+func jsonStringInner(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&b, `\u%04x`, r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
+}
+
+func jsonString(s string) string { return `"` + jsonStringInner(s) + `"` }
+
+// jsonMarshalJS marshals compactly without Go's default HTML escaping,
+// matching JS JSON.stringify output for the characters <, > and &.
+func jsonMarshalJS(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
 
 func msToTime(ms int64) time.Time {
 	if ms == 0 {
@@ -232,22 +279,31 @@ func (m *ToolResultMessage) MarshalJSON() ([]byte, error) {
 	if m.Details != nil {
 		out["details"] = m.Details
 	}
+	if m.Usage != nil {
+		out["usage"] = m.Usage
+	}
+	if m.AddedToolNames != nil {
+		out["addedToolNames"] = m.AddedToolNames
+	}
 	return json.Marshal(out)
 }
 
 func (m *ToolResultMessage) UnmarshalJSON(data []byte) error {
 	var v struct {
-		ToolCallID string          `json:"toolCallId"`
-		ToolName   string          `json:"toolName"`
-		Content    json.RawMessage `json:"content"`
-		Details    json.RawMessage `json:"details"`
-		IsError    bool            `json:"isError"`
-		Timestamp  int64           `json:"timestamp"`
+		ToolCallID     string          `json:"toolCallId"`
+		ToolName       string          `json:"toolName"`
+		Content        json.RawMessage `json:"content"`
+		Details        json.RawMessage `json:"details"`
+		Usage          *Usage          `json:"usage"`
+		AddedToolNames []string        `json:"addedToolNames"`
+		IsError        bool            `json:"isError"`
+		Timestamp      int64           `json:"timestamp"`
 	}
 	if err := json.Unmarshal(data, &v); err != nil {
 		return err
 	}
 	m.ToolCallID, m.ToolName, m.IsError = v.ToolCallID, v.ToolName, v.IsError
+	m.Usage, m.AddedToolNames = v.Usage, v.AddedToolNames
 	m.Timestamp = msToTime(v.Timestamp)
 	if len(v.Details) > 0 {
 		var d any

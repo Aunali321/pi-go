@@ -1,15 +1,33 @@
 package llm
 
 func calculateCost(m *Model, u *Usage) {
-	u.Cost.Input = m.Cost.Input / 1_000_000 * float64(u.Input)
-	u.Cost.Output = m.Cost.Output / 1_000_000 * float64(u.Output)
-	u.Cost.CacheRead = m.Cost.CacheRead / 1_000_000 * float64(u.CacheRead)
-	u.Cost.CacheWrite = m.Cost.CacheWrite / 1_000_000 * float64(u.CacheWrite)
+	rates := PricingTier{
+		Input:      m.Cost.Input,
+		Output:     m.Cost.Output,
+		CacheRead:  m.Cost.CacheRead,
+		CacheWrite: m.Cost.CacheWrite,
+	}
+	inputTokens := u.Input + u.CacheRead + u.CacheWrite
+	matched := -1
+	for _, tier := range m.Cost.Tiers {
+		if inputTokens > tier.InputTokensAbove && tier.InputTokensAbove > matched {
+			rates = tier
+			matched = tier.InputTokensAbove
+		}
+	}
+
+	// Anthropic charges 2x base input for 1h cache writes.
+	longWrite := u.CacheWrite1h
+	shortWrite := u.CacheWrite - longWrite
+	u.Cost.Input = rates.Input / 1_000_000 * float64(u.Input)
+	u.Cost.Output = rates.Output / 1_000_000 * float64(u.Output)
+	u.Cost.CacheRead = rates.CacheRead / 1_000_000 * float64(u.CacheRead)
+	u.Cost.CacheWrite = (rates.CacheWrite*float64(shortWrite) + rates.Input*2*float64(longWrite)) / 1_000_000
 	u.Cost.Total = u.Cost.Input + u.Cost.Output + u.Cost.CacheRead + u.Cost.CacheWrite
 }
 
 var thinkingOrder = []ThinkingLevel{
-	ThinkingOff, ThinkingMinimal, ThinkingLow, ThinkingMedium, ThinkingHigh, ThinkingXHigh,
+	ThinkingOff, ThinkingMinimal, ThinkingLow, ThinkingMedium, ThinkingHigh, ThinkingXHigh, ThinkingMax,
 }
 
 // SupportedThinkingLevels returns the thinking levels a model accepts.
@@ -22,7 +40,7 @@ func SupportedThinkingLevels(m *Model) []ThinkingLevel {
 		if m.NullLevels[level] {
 			continue
 		}
-		if level == ThinkingXHigh {
+		if level == ThinkingXHigh || level == ThinkingMax {
 			if _, ok := m.ThinkingLevelMap[level]; !ok {
 				continue
 			}

@@ -39,7 +39,10 @@ func TestBuildParamsAnthropicCacheAndReasoning(t *testing.T) {
 		t.Fatalf("expected openrouter thinking format, got %q", compat.thinkingFormat)
 	}
 
-	params := buildParams(model, ctx, opts, compat, CacheShort)
+	params, err := buildParams(model, ctx, opts, compat, CacheShort, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	reasoning, ok := params["reasoning"].(map[string]any)
 	if !ok || reasoning["effort"] != "medium" {
@@ -79,7 +82,10 @@ func TestConvertToolResultsAndCalls(t *testing.T) {
 			&ToolResultMessage{ToolCallID: "c1", ToolName: "lookup", Content: []Content{&Text{Text: "found"}}},
 		},
 	}
-	msgs := convertMessages(model, ctx, getCompat(model))
+	msgs, err := convertMessages(model, ctx, getCompat(model), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var am map[string]any
 	for _, m := range msgs {
