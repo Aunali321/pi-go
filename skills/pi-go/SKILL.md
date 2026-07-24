@@ -5,9 +5,9 @@ description: Build Go agents/apps on the pi-go runtime (OpenRouter-only port of 
 
 # pi-go
 
-A Go 1:1 port of pi-agent-core targeting OpenRouter (OpenAI chat-completions wire format). Zero third-party deps. Module path: `github.com/aunali321/pi-go` (local, not yet published — import via a `replace` directive in your `go.mod` pointing at the checkout).
+A Go 1:1 port of pi-agent-core targeting OpenRouter (OpenAI chat-completions wire format). Only dep: `golang.org/x/text`. Module: `github.com/aunali321/pi-go`
 
-Packages (dependency order): `llm` (provider/wire) → `agent` (loop, tools, stateful Agent) → `harness/{env,message,session,compaction}` → `harness` (orchestrator). Most apps need only `llm` + `agent`; add `harness` for on-disk session persistence, compaction, skills, and hooks.
+Packages (dependency order): `llm` (provider/wire) → `agent` (loop, tools, stateful Agent) → `harness/{env,message,session,compaction,tools}` → `harness` (orchestrator). Most apps need only `llm` + `agent`; add `harness` for on-disk session persistence, compaction, skills, and hooks, and `harness/tools` for the built-in bash/read/write/edit tools.
 
 ## Model
 
@@ -15,7 +15,7 @@ There is NO model registry. Construct `*llm.Model` directly. `Provider` and `Bas
 
 ```go
 model := &llm.Model{
-    ID:            "anthropic/claude-3.5-haiku", // OpenRouter model id
+    ID:            "anthropic/claude-opus-4.8", // OpenRouter model id
     Input:         []llm.InputModality{llm.InputText}, // add llm.InputImage for vision
     ContextWindow: 200000,
     MaxTokens:     1024,
@@ -113,9 +113,8 @@ The harness persists every message to JSONL automatically. Reopen with `repo.Ope
 ## Gotchas
 
 - Streaming text is ONLY in `MessageUpdate.Event.(llm.TextDeltaEvent).Delta`. `MessageEnd.Message` carries the final assistant message.
-- Vision needs `llm.InputImage` in `Model.Input` AND a vision-capable model. `anthropic/claude-3.5-haiku` rejects images; use `openai/gpt-4o-mini`, gemini, or claude-sonnet. Images: `&llm.Image{Data: base64Std, MimeType: "image/png"}` in a `UserMessage`.
+- Vision needs `llm.InputImage` in `Model.Input` AND a vision-capable model.
 - Anthropic cache control (`cache_control` markers) auto-applies for `anthropic/*` model ids on OpenRouter when `CacheRetention != CacheNone`.
 - Pass a real `context.Context`; cancel it to abort a run (provider stream + tools observe it).
 - Tool args must be JSON-decodable into the typed struct; a decode failure surfaces as an error tool result.
 - `agent.Run` / `harness.Prompt` block. For concurrent steer/abort, run them in a goroutine and use `a.Steer`/`a.Abort` / `h.Steer`/`h.Abort` from another.
-

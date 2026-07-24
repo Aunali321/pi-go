@@ -1,9 +1,10 @@
 # pi-go
 
-A Go port of the [pi](https://pi.dev) agent runtime, targeting **OpenRouter** (the
-OpenAI chat-completions wire format). It ports the parts that matter for running
-an agent: the turn loop, tool calling, streaming, message conversion, and prompt
-cache control. The TUI and coding tools are out of scope.
+A Go port of the [pi](https://pi.dev) agent runtime (tracking upstream
+v0.82.0), targeting **OpenRouter** (the OpenAI chat-completions wire format).
+It ports the parts that matter for running an agent: the turn loop, tool
+calling, streaming, message conversion, prompt cache control, and the built-in
+execution tools (bash, read, write, edit). The TUI is out of scope.
 
 Requires Go 1.26.
 
@@ -24,6 +25,9 @@ Layered as a clean dependency DAG (each imports only those above it):
   storage, repos, `Session`, context reconstruction, UUIDv7.
 - `harness/compaction` — token estimation, compaction cut-point selection,
   summary + branch-summary generation.
+- `harness/tools` — the built-in execution tools (bash, read, write, edit)
+  with output truncation, shell capture, fuzzy edit matching, and diff
+  rendering.
 - `harness` — the `AgentHarness` orchestrator: ties the agent loop to a
   persistent session with resources, compaction, branch navigation, and a rich
   event/hook system. Also skills, prompt templates, and system-prompt assembly.
