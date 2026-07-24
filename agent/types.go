@@ -52,11 +52,12 @@ type BeforeToolResult struct {
 }
 
 // AfterToolResult overrides parts of an executed tool result. Nil fields keep
-// the original value.
+// the original value. No deep merge is performed.
 type AfterToolResult struct {
 	Content   []llm.Content
 	Details   any
 	IsError   *bool
+	Usage     *llm.Usage
 	Terminate *bool
 }
 

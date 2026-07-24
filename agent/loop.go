@@ -73,7 +73,16 @@ func runLoop(ctx context.Context, agentCtx *Context, newMessages *[]AgentMessage
 			var toolResults []*llm.ToolResultMessage
 			hasMoreToolCalls = false
 			if len(tcs) > 0 {
-				batch := executeToolCalls(ctx, agentCtx, msg, &cfg, emit)
+				// A "length" stop means the output was cut off by the token
+				// limit, so every tool call in the message may carry truncated
+				// arguments. Fail them all instead of executing potentially
+				// borked calls.
+				var batch toolBatch
+				if msg.StopReason == llm.StopLength {
+					batch = failTruncatedToolCalls(tcs, emit)
+				} else {
+					batch = executeToolCalls(ctx, agentCtx, msg, &cfg, emit)
+				}
 				toolResults = batch.messages
 				hasMoreToolCalls = !batch.terminate
 				for _, r := range toolResults {

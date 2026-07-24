@@ -18,9 +18,15 @@ const (
 // ToolResult is the outcome of a tool execution. Content is returned to the
 // model; Details is opaque structured data for logs or UI.
 type ToolResult struct {
-	Content   []llm.Content
-	Details   any
-	Terminate bool
+	Content []llm.Content
+	Details any
+	// Usage from the tool execution itself, if available. Not used for main
+	// LLM context accounting.
+	Usage *llm.Usage
+	// AddedToolNames lists tools introduced by this result and available from
+	// this transcript point onward.
+	AddedToolNames []string
+	Terminate      bool
 }
 
 // UpdateFunc streams partial results during a long-running tool execution.
@@ -82,6 +88,12 @@ func findTool(tools []Tool, name string) Tool {
 	return nil
 }
 
+// ConstrainedSampler is optionally implemented by tools that request
+// provider-side constrained sampling for their schema.
+type ConstrainedSampler interface {
+	ConstrainedSampling() *llm.ConstrainedSampling
+}
+
 func toLLMTools(tools []Tool) []llm.Tool {
 	if len(tools) == 0 {
 		return nil
@@ -89,6 +101,9 @@ func toLLMTools(tools []Tool) []llm.Tool {
 	out := make([]llm.Tool, len(tools))
 	for i, t := range tools {
 		out[i] = llm.Tool{Name: t.Name(), Description: t.Description(), Parameters: t.Schema()}
+		if cs, ok := t.(ConstrainedSampler); ok {
+			out[i].ConstrainedSampling = cs.ConstrainedSampling()
+		}
 	}
 	return out
 }

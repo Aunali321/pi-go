@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aunali321/pi-go/llm"
@@ -147,6 +148,32 @@ func executeParallel(ctx context.Context, agentCtx *Context, assistant *llm.Assi
 	return toolBatch{messages, shouldTerminate(results)}
 }
 
+// failTruncatedToolCalls fails all tool calls from an assistant message that
+// was truncated by the output token limit. Streamed tool-call arguments are
+// finalized with a best-effort JSON salvage parser, so a truncated message can
+// yield tool calls whose arguments parse but are silently incomplete. None of
+// them are safe to execute; report each as an error so the model can re-issue
+// them.
+func failTruncatedToolCalls(tcs []*llm.ToolCall, emit EventSink) toolBatch {
+	var messages []*llm.ToolResultMessage
+	for _, tc := range tcs {
+		emit(ToolExecutionStart{tc.ID, tc.Name, tc.Arguments})
+		f := finalized{
+			toolCall: tc,
+			result: textResult(fmt.Sprintf(
+				"Tool call %q was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
+				tc.Name)),
+			isError: true,
+		}
+		emit(ToolExecutionEnd{f.toolCall.ID, f.toolCall.Name, f.result, f.isError})
+		trm := toolResultMessage(f)
+		emit(MessageStart{trm})
+		emit(MessageEnd{trm})
+		messages = append(messages, trm)
+	}
+	return toolBatch{messages, false}
+}
+
 func prepareToolCall(ctx context.Context, agentCtx *Context, assistant *llm.AssistantMessage, tc *llm.ToolCall, cfg *Config) preparation {
 	tool := findTool(agentCtx.Tools, tc.Name)
 	if tool == nil {
@@ -180,6 +207,11 @@ func prepareToolCall(ctx context.Context, agentCtx *Context, assistant *llm.Assi
 }
 
 func executePrepared(ctx context.Context, p preparation, emit EventSink) (result ToolResult, isError bool) {
+	// The update callback is scoped to this execution: calls made by stray
+	// goroutines after Execute settles are ignored.
+	var acceptingUpdates atomic.Bool
+	acceptingUpdates.Store(true)
+	defer acceptingUpdates.Store(false)
 	defer func() {
 		if r := recover(); r != nil {
 			result = textResult(fmt.Sprintf("tool %q panicked: %v", p.toolCall.Name, r))
@@ -189,6 +221,9 @@ func executePrepared(ctx context.Context, p preparation, emit EventSink) (result
 
 	raw, _ := json.Marshal(p.toolCall.Arguments)
 	res, err := p.tool.Execute(ctx, p.toolCall.ID, raw, func(partial ToolResult) {
+		if !acceptingUpdates.Load() {
+			return
+		}
 		emit(ToolExecutionUpdate{p.toolCall.ID, p.toolCall.Name, p.toolCall.Arguments, partial})
 	})
 	if err != nil {
@@ -214,6 +249,9 @@ func finalizeToolCall(ctx context.Context, agentCtx *Context, assistant *llm.Ass
 			if after.Details != nil {
 				result.Details = after.Details
 			}
+			if after.Usage != nil {
+				result.Usage = after.Usage
+			}
 			if after.Terminate != nil {
 				result.Terminate = *after.Terminate
 			}
@@ -226,14 +264,19 @@ func finalizeToolCall(ctx context.Context, agentCtx *Context, assistant *llm.Ass
 }
 
 func toolResultMessage(f finalized) *llm.ToolResultMessage {
-	return &llm.ToolResultMessage{
+	msg := &llm.ToolResultMessage{
 		ToolCallID: f.toolCall.ID,
 		ToolName:   f.toolCall.Name,
 		Content:    f.result.Content,
 		Details:    f.result.Details,
+		Usage:      f.result.Usage,
 		IsError:    f.isError,
 		Timestamp:  time.Now(),
 	}
+	if len(f.result.AddedToolNames) > 0 {
+		msg.AddedToolNames = f.result.AddedToolNames
+	}
+	return msg
 }
 
 func shouldTerminate(all []finalized) bool {

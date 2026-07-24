@@ -73,7 +73,7 @@ type AgentOptions struct {
 
 	BeforeToolCall  func(ctx context.Context, c BeforeToolCall) BeforeToolResult
 	AfterToolCall   func(ctx context.Context, c AfterToolCall) *AfterToolResult
-	PrepareNextTurn func(ctx context.Context) *TurnUpdate
+	PrepareNextTurn func(ctx context.Context, info TurnInfo) *TurnUpdate
 
 	SteeringMode  QueueMode
 	FollowUpMode  QueueMode
@@ -258,7 +258,7 @@ func (a *Agent) PromptMessages(ctx context.Context, messages []AgentMessage) err
 	}
 	a.mu.Unlock()
 	return a.runWithLifecycle(ctx, func(runCtx context.Context) {
-		Run(runCtx, messages, a.contextSnapshot(), a.loopConfig(false), a.processEvents(runCtx))
+		Run(runCtx, messages, a.contextSnapshot(), a.loopConfig(runCtx, false), a.processEvents(runCtx))
 	})
 }
 
@@ -278,18 +278,18 @@ func (a *Agent) Continue(ctx context.Context) error {
 	if last.Role() == "assistant" {
 		if drained := a.steeringQ.drain(); len(drained) > 0 {
 			return a.runWithLifecycle(ctx, func(runCtx context.Context) {
-				Run(runCtx, drained, a.contextSnapshot(), a.loopConfig(true), a.processEvents(runCtx))
+				Run(runCtx, drained, a.contextSnapshot(), a.loopConfig(runCtx, true), a.processEvents(runCtx))
 			})
 		}
 		if drained := a.followUpQ.drain(); len(drained) > 0 {
 			return a.runWithLifecycle(ctx, func(runCtx context.Context) {
-				Run(runCtx, drained, a.contextSnapshot(), a.loopConfig(false), a.processEvents(runCtx))
+				Run(runCtx, drained, a.contextSnapshot(), a.loopConfig(runCtx, false), a.processEvents(runCtx))
 			})
 		}
 		return errors.New("cannot continue from message role: assistant")
 	}
 	return a.runWithLifecycle(ctx, func(runCtx context.Context) {
-		Continue(runCtx, a.contextSnapshot(), a.loopConfig(false), a.processEvents(runCtx))
+		Continue(runCtx, a.contextSnapshot(), a.loopConfig(runCtx, false), a.processEvents(runCtx))
 	})
 }
 
@@ -303,7 +303,7 @@ func (a *Agent) contextSnapshot() *Context {
 	}
 }
 
-func (a *Agent) loopConfig(skipInitialSteeringPoll bool) *Config {
+func (a *Agent) loopConfig(runCtx context.Context, skipInitialSteeringPoll bool) *Config {
 	skip := skipInitialSteeringPoll
 	reasoning := a.state.ThinkingLevel
 	if reasoning == llm.ThinkingOff {
@@ -324,11 +324,11 @@ func (a *Agent) loopConfig(skipInitialSteeringPoll bool) *Config {
 		ToolExecution:    a.opts.ToolExecution,
 		BeforeToolCall:   a.opts.BeforeToolCall,
 		AfterToolCall:    a.opts.AfterToolCall,
-		PrepareNextTurn: func(TurnInfo) *TurnUpdate {
+		PrepareNextTurn: func(info TurnInfo) *TurnUpdate {
 			if a.opts.PrepareNextTurn == nil {
 				return nil
 			}
-			return a.opts.PrepareNextTurn(context.Background())
+			return a.opts.PrepareNextTurn(runCtx, info)
 		},
 		GetSteeringMessages: func() []AgentMessage {
 			if skip {
