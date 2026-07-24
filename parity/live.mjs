@@ -1,6 +1,6 @@
 import { AgentHarness, JsonlSessionRepo } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
-import { streamSimple } from "@earendil-works/pi-ai";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { readFileSync } from "node:fs";
 
 function visionModel() {

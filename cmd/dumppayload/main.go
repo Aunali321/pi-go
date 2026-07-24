@@ -182,6 +182,91 @@ func scenarios() map[string]scenario {
 				Tools: []llm.Tool{weatherTool},
 			},
 		},
+		"notooloutput": {
+			model: mkModel("anthropic/claude-3.5-haiku", false),
+			opts:  &llm.StreamOptions{APIKey: "dummy", CacheRetention: llm.CacheNone, MaxTokens: 1024},
+			ctx: &llm.Context{
+				SystemPrompt: "sys",
+				Messages: []llm.Message{
+					&llm.UserMessage{Content: []llm.Content{&llm.Text{Text: "go"}}, Timestamp: ts(1)},
+					asst(&llm.ToolCall{ID: "c1", Name: "get_weather", Arguments: map[string]any{"city": "X"}}),
+					&llm.ToolResultMessage{ToolCallID: "c1", ToolName: "get_weather", Timestamp: ts(3)},
+				},
+				Tools: []llm.Tool{weatherTool},
+			},
+		},
+		"kimideferred": {
+			model: func() *llm.Model {
+				m := mkModel("moonshot/kimi-k2", false)
+				m.Compat = &llm.Compat{DeferredToolsMode: llm.DeferredToolsKimi}
+				return m
+			}(),
+			opts: &llm.StreamOptions{APIKey: "dummy", CacheRetention: llm.CacheNone, MaxTokens: 1024},
+			ctx: &llm.Context{
+				SystemPrompt: "sys",
+				Messages: []llm.Message{
+					&llm.UserMessage{Content: []llm.Content{&llm.Text{Text: "go"}}, Timestamp: ts(1)},
+					&llm.AssistantMessage{Content: []llm.Content{&llm.ToolCall{ID: "c1", Name: "lookup", Arguments: map[string]any{}}}, API: "openai-completions", Provider: "openrouter", Model: "moonshot/kimi-k2", StopReason: llm.StopToolUse, Timestamp: ts(2)},
+					&llm.ToolResultMessage{ToolCallID: "c1", ToolName: "lookup", Content: []llm.Content{&llm.Text{Text: "found"}}, AddedToolNames: []string{"get_weather"}, Timestamp: ts(3)},
+				},
+				Tools: []llm.Tool{weatherTool, {Name: "lookup", Description: "Look something up.", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}}},
+			},
+		},
+		"grammartool": {
+			model: func() *llm.Model {
+				m := mkModel("openai/gpt-5.2", false)
+				t := true
+				m.Compat = &llm.Compat{SupportsOpenAIGrammarTools: &t}
+				return m
+			}(),
+			opts: &llm.StreamOptions{APIKey: "dummy", CacheRetention: llm.CacheNone, MaxTokens: 1024},
+			ctx: &llm.Context{
+				SystemPrompt: "sys",
+				Messages: []llm.Message{
+					&llm.UserMessage{Content: []llm.Content{&llm.Text{Text: "go"}}, Timestamp: ts(1)},
+					&llm.AssistantMessage{Content: []llm.Content{&llm.ToolCall{ID: "g1", Name: "run_sql", Arguments: map[string]any{"query": "select 1"}}}, API: "openai-completions", Provider: "openrouter", Model: "openai/gpt-5.2", StopReason: llm.StopToolUse, Timestamp: ts(2)},
+					&llm.ToolResultMessage{ToolCallID: "g1", ToolName: "run_sql", Content: []llm.Content{&llm.Text{Text: "1"}}, Timestamp: ts(3)},
+				},
+				Tools: []llm.Tool{
+					{Name: "run_sql", Description: "Run SQL.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}, "required": []string{"query"}}, ConstrainedSampling: &llm.ConstrainedSampling{Type: "grammar", Variants: map[llm.GrammarFormat]string{llm.GrammarOpenAILark: "start: /.+/"}}},
+					{Name: "strict_tool", Description: "Strict.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"a": map[string]any{"type": "string"}}, "required": []string{"a"}}, ConstrainedSampling: &llm.ConstrainedSampling{Type: "json_schema", Strict: "prefer"}},
+				},
+			},
+		},
+		"zaithinking": {
+			model: func() *llm.Model {
+				m := mkModel("z-ai/glm-5", true)
+				m.Compat = &llm.Compat{ThinkingFormat: llm.ThinkingFormatZAI}
+				return m
+			}(),
+			opts: &llm.StreamOptions{APIKey: "dummy", CacheRetention: llm.CacheNone, MaxTokens: 1024, Reasoning: llm.ThinkingMedium},
+			ctx:  &llm.Context{SystemPrompt: "sys", Messages: []llm.Message{&llm.UserMessage{Content: []llm.Content{&llm.Text{Text: "hi"}}, Timestamp: ts(1)}}},
+		},
+		"chattemplate": {
+			model: func() *llm.Model {
+				m := mkModel("qwen/qwen4", true)
+				m.Compat = &llm.Compat{
+					ThinkingFormat: llm.ThinkingFormatChatTemplate,
+					ChatTemplateKwargs: map[string]llm.ChatTemplateKwarg{
+						"enable_thinking": {Var: "thinking.enabled"},
+						"thinking_effort": {Var: "thinking.effort", OmitWhenOff: true},
+						"fixed":           {Value: "on"},
+					},
+				}
+				return m
+			}(),
+			opts: &llm.StreamOptions{APIKey: "dummy", CacheRetention: llm.CacheNone, MaxTokens: 1024, Reasoning: llm.ThinkingLow},
+			ctx:  &llm.Context{SystemPrompt: "sys", Messages: []llm.Message{&llm.UserMessage{Content: []llm.Content{&llm.Text{Text: "hi"}}, Timestamp: ts(1)}}},
+		},
+		"clampmax": {
+			model: func() *llm.Model {
+				m := mkModel("anthropic/claude-3.5-haiku", false)
+				m.ContextWindow = 5000
+				return m
+			}(),
+			opts: &llm.StreamOptions{APIKey: "dummy", CacheRetention: llm.CacheNone, MaxTokens: 4096},
+			ctx:  &llm.Context{SystemPrompt: "sys", Messages: []llm.Message{&llm.UserMessage{Content: []llm.Content{&llm.Text{Text: "hello there"}}, Timestamp: ts(1)}}},
+		},
 	}
 }
 

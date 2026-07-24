@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Execution-parity harness: compares this Go port against the published @earendil-works/pi-agent-core",
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.77.0",
-    "@earendil-works/pi-ai": "^0.77.0"
+    "@earendil-works/pi-agent-core": "^0.82.0",
+    "@earendil-works/pi-ai": "^0.82.0"
   }
 }

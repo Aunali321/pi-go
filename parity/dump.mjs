@@ -1,4 +1,4 @@
-import { streamSimple } from "@earendil-works/pi-ai";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
@@ -162,6 +162,63 @@ const scenarios = {
       ],
       tools: [weatherTool],
     },
+  },
+  notooloutput: {
+    model: model("anthropic/claude-3.5-haiku", false),
+    options: { cacheRetention: "none", maxTokens: 1024 },
+    context: {
+      systemPrompt: "sys",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "go" }], timestamp: 1 },
+        { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "get_weather", arguments: { city: "X" } }], api: "openai-completions", provider: "openrouter", model: "anthropic/claude-3.5-haiku", usage, stopReason: "toolUse", timestamp: 2 },
+        { role: "toolResult", toolCallId: "c1", toolName: "get_weather", content: [], isError: false, timestamp: 3 },
+      ],
+      tools: [weatherTool],
+    },
+  },
+  kimideferred: {
+    model: { ...model("moonshot/kimi-k2", false), compat: { deferredToolsMode: "kimi" } },
+    options: { cacheRetention: "none", maxTokens: 1024 },
+    context: {
+      systemPrompt: "sys",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "go" }], timestamp: 1 },
+        { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "lookup", arguments: {} }], api: "openai-completions", provider: "openrouter", model: "moonshot/kimi-k2", usage, stopReason: "toolUse", timestamp: 2 },
+        { role: "toolResult", toolCallId: "c1", toolName: "lookup", content: [{ type: "text", text: "found" }], addedToolNames: ["get_weather"], isError: false, timestamp: 3 },
+      ],
+      tools: [weatherTool, { name: "lookup", description: "Look something up.", parameters: { type: "object", properties: {} } }],
+    },
+  },
+  grammartool: {
+    model: { ...model("openai/gpt-5.2", false), compat: { supportsOpenAIGrammarTools: true } },
+    options: { cacheRetention: "none", maxTokens: 1024 },
+    context: {
+      systemPrompt: "sys",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "go" }], timestamp: 1 },
+        { role: "assistant", content: [{ type: "toolCall", id: "g1", name: "run_sql", arguments: { query: "select 1" } }], api: "openai-completions", provider: "openrouter", model: "openai/gpt-5.2", usage, stopReason: "toolUse", timestamp: 2 },
+        { role: "toolResult", toolCallId: "g1", toolName: "run_sql", content: [{ type: "text", text: "1" }], isError: false, timestamp: 3 },
+      ],
+      tools: [
+        { name: "run_sql", description: "Run SQL.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }, constrainedSampling: { type: "grammar", variants: { openai_lark: "start: /.+/" } } },
+        { name: "strict_tool", description: "Strict.", parameters: { type: "object", properties: { a: { type: "string" } }, required: ["a"] }, constrainedSampling: { type: "json_schema", strict: "prefer" } },
+      ],
+    },
+  },
+  zaithinking: {
+    model: { ...model("z-ai/glm-5", true), compat: { thinkingFormat: "zai" } },
+    options: { cacheRetention: "none", maxTokens: 1024, reasoning: "medium" },
+    context: { systemPrompt: "sys", messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 1 }] },
+  },
+  chattemplate: {
+    model: { ...model("qwen/qwen4", true), compat: { thinkingFormat: "chat-template", chatTemplateKwargs: { enable_thinking: { $var: "thinking.enabled" }, thinking_effort: { $var: "thinking.effort", omitWhenOff: true }, fixed: "on" } } },
+    options: { cacheRetention: "none", maxTokens: 1024, reasoning: "low" },
+    context: { systemPrompt: "sys", messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 1 }] },
+  },
+  clampmax: {
+    model: { ...model("anthropic/claude-3.5-haiku", false), contextWindow: 5000 },
+    options: { cacheRetention: "none", maxTokens: 4096 },
+    context: { systemPrompt: "sys", messages: [{ role: "user", content: [{ type: "text", text: "hello there" }], timestamp: 1 }] },
   },
 };
 

@@ -1,5 +1,5 @@
 import { AgentHarness, InMemorySessionRepo } from "@earendil-works/pi-agent-core";
-import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 
 const model = {
   id: "anthropic/claude-3.5-haiku", name: "Claude 3.5 Haiku", api: "openai-completions",
@@ -13,14 +13,19 @@ const tool = {
   execute: async (_id, params) => ({ content: [{ type: "text", text: "12C overcast" }], details: { city: params.city } }),
 };
 
-const env = new NodeExecutionEnv({ cwd: process.cwd() });
 const repo = new InMemorySessionRepo();
 const session = await repo.create();
 
+// Minimal Models stand-in: the harness only calls streamSimple (and
+// completeSimple for compaction, unused in this run).
+const models = {
+  streamSimple: (m, c, o) => streamSimple(m, c, { ...o, apiKey: "dummy" }),
+  completeSimple: async (m, c, o) => streamSimple(m, c, { ...o, apiKey: "dummy" }).result(),
+};
+
 const harness = new AgentHarness({
-  env, session, tools: [tool], model,
+  session, models, tools: [tool], model,
   systemPrompt: "You are a helpful assistant.",
-  getApiKeyAndHeaders: async () => ({ apiKey: "dummy" }),
   streamOptions: { cacheRetention: "short", headers: { "x-client": "js" } },
 });
 

@@ -29,6 +29,17 @@ const fixtures = {
   cachetokens: [d({ role: "assistant", content: "hi" }), d({}, "stop"), c([], { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, prompt_tokens_details: { cached_tokens: 50 } })],
   lengthfinish: [d({ content: "truncated" }), d({}, "length"), c([], usage)],
   contentfilter: [d({ content: "x" }), d({}, "content_filter"), c([], usage)],
+  customtool: [
+    d({ role: "assistant", tool_calls: [{ index: 0, id: "g1", type: "custom", custom: { name: "run_sql", input: "" } }] }),
+    d({ tool_calls: [{ index: 0, custom: { input: "select" } }] }),
+    d({ tool_calls: [{ index: 0, custom: { input: " 1" } }] }),
+    d({}, "tool_calls"), c([], usage),
+  ],
+  pendingdetail: [
+    d({ role: "assistant", reasoning_details: [{ type: "reasoning.encrypted", id: "c9", data: "ENC" }] }),
+    d({ tool_calls: [{ index: 0, id: "c9", type: "function", function: { name: "a", arguments: "{}" } }] }),
+    d({}, "tool_calls"), c([], usage),
+  ],
   reasoning_details: [
     d({ role: "assistant", tool_calls: [{ index: 0, id: "c0", type: "function", function: { name: "a", arguments: "{}" } }] }),
     d({ reasoning_details: [{ type: "reasoning.encrypted", id: "c0", data: "ENC" }] }),
